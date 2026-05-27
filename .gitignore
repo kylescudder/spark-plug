@@ -1,0 +1,5 @@
+.build/
+.swiftpm/
+SparkPlug.app/
+SparkPlug-*.zip
+.DS_Store
