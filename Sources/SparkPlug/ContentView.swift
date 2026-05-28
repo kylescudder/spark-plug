@@ -6,9 +6,24 @@ private let relativeFormatter: RelativeDateTimeFormatter = {
     return f
 }()
 
+/// Tight "3m" / "2h" / "5d" / "2w" / "4mo" / "1y" style — no "ago".
+private func relativeShort(_ date: Date) -> String {
+    let secs = max(0, Date().timeIntervalSince(date))
+    switch secs {
+    case ..<60:       return "just now"
+    case ..<3600:     return "\(Int(secs / 60))m"
+    case ..<86_400:   return "\(Int(secs / 3600))h"
+    case ..<604_800:  return "\(Int(secs / 86_400))d"
+    case ..<2_592_000:return "\(Int(secs / 604_800))w"
+    case ..<31_536_000: return "\(Int(secs / 2_592_000))mo"
+    default:          return "\(Int(secs / 31_536_000))y"
+    }
+}
+
 struct ContentView: View {
     @StateObject private var store = WorktreeStore()
     @State private var pendingNewSession: Worktree?
+    @State private var sessionToDelete: ClaudeSession?
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
@@ -32,6 +47,27 @@ struct ContentView: View {
                 store.launchClaude(in: wt, newSessionName: name)
                 store.scan()
             }
+        }
+        .confirmationDialog(
+            "Delete this session?",
+            isPresented: Binding(
+                get: { sessionToDelete != nil },
+                set: { if !$0 { sessionToDelete = nil } }
+            ),
+            presenting: sessionToDelete
+        ) { session in
+            Button("Delete", role: .destructive) {
+                store.deleteSession(session)
+                sessionToDelete = nil
+            }
+            Button("Cancel", role: .cancel) {
+                sessionToDelete = nil
+            }
+        } message: { session in
+            let title = session.customTitle
+                ?? session.firstMessage.map { $0.count > 40 ? String($0.prefix(40)) + "…" : $0 }
+                ?? String(session.id.prefix(8))
+            Text("This permanently deletes the transcript for “\(title)”. This can't be undone.")
         }
     }
 
@@ -126,11 +162,11 @@ struct ContentView: View {
             }
             Spacer()
             Button {
-                store.revealInFinder(wt)
+                store.openInFinder(wt)
             } label: {
-                Image(systemName: "magnifyingglass")
+                Image(systemName: "folder")
             }
-            .help("Reveal in Finder")
+            .help("Open in Finder")
             .buttonStyle(.borderless)
 
             continueMenu(for: wt)
@@ -154,12 +190,31 @@ struct ContentView: View {
                 Text("No sessions yet")
             } else {
                 ForEach(sessions) { s in
-                    Button {
-                        store.launchClaude(in: wt, resumeSessionId: s.id)
+                    Menu {
+                        Button {
+                            store.launchClaude(in: wt, resumeSessionId: s.id)
+                        } label: {
+                            Label("Resume", systemImage: "arrow.uturn.forward")
+                        }
+                        .disabled(s.isLive)
+
+                        Button {
+                            store.revealSessionInFinder(s)
+                        } label: {
+                            Label("Show Transcript in Finder", systemImage: "doc.text.magnifyingglass")
+                        }
+
+                        Divider()
+
+                        Button(role: .destructive) {
+                            sessionToDelete = s
+                        } label: {
+                            Label("Delete…", systemImage: "trash")
+                        }
+                        .disabled(s.isLive)
                     } label: {
                         Text(sessionLabel(s))
                     }
-                    .disabled(s.isLive)
                 }
             }
         } label: {
@@ -172,7 +227,7 @@ struct ContentView: View {
     }
 
     private func sessionLabel(_ s: ClaudeSession) -> String {
-        let when = relativeFormatter.localizedString(for: s.lastModified, relativeTo: Date())
+        let when = relativeShort(s.lastModified)
         let title: String = {
             if let t = s.customTitle, !t.isEmpty { return t }
             if let first = s.firstMessage, !first.isEmpty {
@@ -181,28 +236,29 @@ struct ContentView: View {
             return String(s.id.prefix(8))
         }()
         let live = s.isLive ? "● live · " : ""
-        return "\(live)\(title)  ·  \(when)"
+        return "\(live)\(title) · \(when)"
     }
 
     @ViewBuilder
     private func sessionBadge(_ wt: Worktree) -> some View {
         let label: String = {
             if let last = wt.lastSessionAt {
-                let when = relativeFormatter.localizedString(for: last, relativeTo: Date())
-                return "\(wt.sessionCount) session\(wt.sessionCount == 1 ? "" : "s") · \(when)"
+                return "\(wt.sessionCount) · \(relativeShort(last))"
             }
-            return "\(wt.sessionCount) session\(wt.sessionCount == 1 ? "" : "s")"
+            return "\(wt.sessionCount)"
         }()
         HStack(spacing: 3) {
             Image(systemName: "sparkle")
             Text(label)
         }
         .font(.caption2)
+        .lineLimit(1)
+        .fixedSize(horizontal: true, vertical: false)
         .padding(.horizontal, 6)
         .padding(.vertical, 2)
         .background(Color.orange.opacity(0.18), in: Capsule())
         .foregroundStyle(.orange)
-        .help("Claude session history exists for this folder")
+        .help("\(wt.sessionCount) Claude session\(wt.sessionCount == 1 ? "" : "s") for this folder")
     }
 }
 

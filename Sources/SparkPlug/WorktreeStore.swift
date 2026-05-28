@@ -108,8 +108,36 @@ final class WorktreeStore: ObservableObject {
         }
     }
 
-    func revealInFinder(_ worktree: Worktree) {
-        NSWorkspace.shared.activateFileViewerSelecting([worktree.url])
+    func openInFinder(_ worktree: Worktree) {
+        NSWorkspace.shared.open(worktree.url)
+    }
+
+    func revealSessionInFinder(_ session: ClaudeSession) {
+        NSWorkspace.shared.activateFileViewerSelecting([session.fileURL])
+    }
+
+    /// Permanently deletes a session's `.jsonl` and its companion subagent
+    /// directory (if any). Refuses to act on a live session.
+    @discardableResult
+    func deleteSession(_ session: ClaudeSession) -> Bool {
+        guard !session.isLive else {
+            errorMessage = "Cannot delete a live session — quit Claude first."
+            return false
+        }
+        let fm = FileManager.default
+        do {
+            try fm.removeItem(at: session.fileURL)
+            let companion = session.fileURL.deletingLastPathComponent()
+                .appendingPathComponent(session.id, isDirectory: true)
+            if fm.fileExists(atPath: companion.path) {
+                try? fm.removeItem(at: companion)
+            }
+            scan()
+            return true
+        } catch {
+            errorMessage = "Failed to delete session: \(error.localizedDescription)"
+            return false
+        }
     }
 
     private func singleQuote(_ path: String) -> String {
