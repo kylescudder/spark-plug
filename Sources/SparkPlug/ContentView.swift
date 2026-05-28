@@ -9,6 +9,7 @@ private let relativeFormatter: RelativeDateTimeFormatter = {
 struct ContentView: View {
     @StateObject private var store = WorktreeStore()
     @State private var pendingNewSession: Worktree?
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         VStack(spacing: 0) {
@@ -40,6 +41,13 @@ struct ContentView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
             Spacer()
+            Button {
+                openWindow(id: "main")
+                NSApp.activate(ignoringOtherApps: true)
+            } label: {
+                Label("Open Window", systemImage: "macwindow")
+            }
+            .buttonStyle(.borderless)
             Button {
                 NSApp.terminate(nil)
             } label: {

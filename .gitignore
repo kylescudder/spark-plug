@@ -2,4 +2,5 @@
 .swiftpm/
 SparkPlug.app/
 SparkPlug-*.zip
+Tools/*.iconset/
 .DS_Store
