@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_NAME="SparkPlug"
+APP_NAME="SparkPlug"          # Swift product / executable / icon base — no spaces
+DISPLAY_NAME="Spark Plug"     # User-facing name: bundle, Spotlight, dock
 BUNDLE_ID="uk.co.crimsontide.SparkPlug"
-VERSION="1.0.0"
+VERSION="1.0.3"
 ROOT="$(cd "$(dirname "$0")" && pwd)"
-APP="$ROOT/$APP_NAME.app"
+APP="$ROOT/$DISPLAY_NAME.app"
 
 echo "▸ Building release…"
 swift build -c release --package-path "$ROOT"
@@ -22,7 +23,7 @@ if [[ ! -f "$ICNS" || "$ROOT/Tools/make-icon.swift" -nt "$ICNS" ]]; then
 fi
 
 echo "▸ Assembling $APP"
-rm -rf "$APP"
+rm -rf "$APP" "$ROOT/$APP_NAME.app"   # drop old one-word bundle so Spotlight doesn't keep both
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/$APP_NAME"
 cp "$ICNS" "$APP/Contents/Resources/$APP_NAME.icns"
@@ -33,13 +34,13 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 <plist version="1.0">
 <dict>
     <key>CFBundleDevelopmentRegion</key>      <string>en</string>
-    <key>CFBundleDisplayName</key>            <string>Spark Plug</string>
+    <key>CFBundleDisplayName</key>            <string>$DISPLAY_NAME</string>
     <key>CFBundleExecutable</key>             <string>$APP_NAME</string>
     <key>CFBundleIconFile</key>               <string>$APP_NAME</string>
     <key>CFBundleIconName</key>               <string>$APP_NAME</string>
     <key>CFBundleIdentifier</key>             <string>$BUNDLE_ID</string>
     <key>CFBundleInfoDictionaryVersion</key>  <string>6.0</string>
-    <key>CFBundleName</key>                   <string>$APP_NAME</string>
+    <key>CFBundleName</key>                   <string>$DISPLAY_NAME</string>
     <key>CFBundlePackageType</key>            <string>APPL</string>
     <key>CFBundleShortVersionString</key>     <string>$VERSION</string>
     <key>CFBundleVersion</key>                <string>$VERSION</string>

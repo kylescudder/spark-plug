@@ -1,6 +1,6 @@
 .build/
 .swiftpm/
-SparkPlug.app/
+*.app/
 SparkPlug-*.zip
 Tools/*.iconset/
 .DS_Store

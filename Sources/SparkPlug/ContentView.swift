@@ -24,6 +24,8 @@ struct ContentView: View {
     @StateObject private var store = WorktreeStore()
     @State private var pendingNewSession: Worktree?
     @State private var sessionToDelete: ClaudeSession?
+    @State private var worktreeToDelete: Worktree?
+    @State private var showNewWorktree = false
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
@@ -48,6 +50,9 @@ struct ContentView: View {
                 store.scan()
             }
         }
+        .sheet(isPresented: $showNewWorktree) {
+            NewWorktreeSheet(store: store)
+        }
         .confirmationDialog(
             "Delete this session?",
             isPresented: Binding(
@@ -68,6 +73,24 @@ struct ContentView: View {
                 ?? session.firstMessage.map { $0.count > 40 ? String($0.prefix(40)) + "…" : $0 }
                 ?? String(session.id.prefix(8))
             Text("This permanently deletes the transcript for “\(title)”. This can't be undone.")
+        }
+        .confirmationDialog(
+            "Delete this worktree?",
+            isPresented: Binding(
+                get: { worktreeToDelete != nil },
+                set: { if !$0 { worktreeToDelete = nil } }
+            ),
+            presenting: worktreeToDelete
+        ) { wt in
+            Button("Delete Worktree", role: .destructive) {
+                store.deleteWorktree(wt)
+                worktreeToDelete = nil
+            }
+            Button("Cancel", role: .cancel) {
+                worktreeToDelete = nil
+            }
+        } message: { wt in
+            Text("This permanently deletes the folder “\(wt.name)” and everything in it. If it's a git worktree, any uncommitted changes are lost. This can't be undone.")
         }
     }
 
@@ -110,6 +133,13 @@ struct ContentView: View {
                     .truncationMode(.middle)
             }
             Spacer()
+            Button {
+                showNewWorktree = true
+            } label: {
+                Label("New Worktree", systemImage: "plus.rectangle.on.folder")
+            }
+            .keyboardShortcut("n", modifiers: .command)
+            .help("Create and provision a new worktree, then open Claude in it")
             Button {
                 store.pickFolder()
             } label: {
@@ -178,6 +208,20 @@ struct ContentView: View {
             }
             .buttonStyle(.borderedProminent)
             .help("Start a new Claude session")
+
+            Menu {
+                Button(role: .destructive) {
+                    worktreeToDelete = wt
+                } label: {
+                    Label("Delete Worktree…", systemImage: "trash")
+                }
+            } label: {
+                Image(systemName: "ellipsis.circle")
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .help("More actions")
         }
         .padding(.vertical, 4)
     }
@@ -310,6 +354,120 @@ private struct NewSessionSheet: View {
     private func commit() {
         guard !trimmed.isEmpty else { return }
         onStart(trimmed)
+        dismiss()
+    }
+}
+
+private struct NewWorktreeSheet: View {
+    @ObservedObject var store: WorktreeStore
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var sourceRepo: String = ""
+    @State private var rememberDefault: Bool = false
+    @State private var ticket: String = ""
+    @State private var briefName: String = ""
+    @State private var baseBranch: String = "develop"
+    @State private var showAdvanced = false
+    @State private var setupCommand: String = ""
+    @FocusState private var ticketFocused: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 8) {
+                Image(systemName: "plus.rectangle.on.folder")
+                    .foregroundStyle(.yellow)
+                Text("New worktree").font(.headline)
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Source repository").font(.caption).foregroundStyle(.secondary)
+                HStack(spacing: 8) {
+                    TextField("/path/to/repo", text: $sourceRepo)
+                        .textFieldStyle(.roundedBorder)
+                    Button("Choose…") {
+                        if let picked = store.pickSourceRepo(startingAt: sourceRepo) {
+                            sourceRepo = picked
+                        }
+                    }
+                }
+                Toggle("Remember as default", isOn: $rememberDefault)
+                    .font(.caption)
+            }
+
+            HStack(spacing: 10) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Ticket").font(.caption).foregroundStyle(.secondary)
+                    TextField("MP5-12345", text: $ticket)
+                        .textFieldStyle(.roundedBorder)
+                        .focused($ticketFocused)
+                }
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Brief name").font(.caption).foregroundStyle(.secondary)
+                    TextField("FixAuthTimeout", text: $briefName)
+                        .textFieldStyle(.roundedBorder)
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Base branch").font(.caption).foregroundStyle(.secondary)
+                TextField("develop", text: $baseBranch)
+                    .textFieldStyle(.roundedBorder)
+            }
+
+            DisclosureGroup("Advanced", isExpanded: $showAdvanced) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Setup command (run in source repo). Placeholders: {ticket} {brief} {base}")
+                        .font(.caption2).foregroundStyle(.secondary)
+                    TextField(WorktreeStore.defaultSetupCommand, text: $setupCommand)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(.caption, design: .monospaced))
+                }
+                .padding(.top, 4)
+            }
+            .font(.caption)
+
+            HStack {
+                Spacer()
+                Button("Cancel", role: .cancel) { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                Button("Start") { commit() }
+                    .keyboardShortcut(.defaultAction)
+                    .buttonStyle(.borderedProminent)
+                    .disabled(!isValid)
+            }
+        }
+        .padding(20)
+        .frame(width: 460)
+        .onAppear {
+            sourceRepo = store.defaultSourceRepo
+            rememberDefault = store.defaultSourceRepo.isEmpty
+            setupCommand = store.setupCommandTemplate
+            ticketFocused = true
+        }
+    }
+
+    private func t(_ s: String) -> String {
+        s.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var isValid: Bool {
+        !t(sourceRepo).isEmpty && !t(ticket).isEmpty && !t(briefName).isEmpty
+    }
+
+    private func commit() {
+        guard isValid else { return }
+        let repo = t(sourceRepo)
+        let base = t(baseBranch).isEmpty ? "develop" : t(baseBranch)
+        if rememberDefault { store.defaultSourceRepo = repo }
+        if t(setupCommand) != store.setupCommandTemplate && !t(setupCommand).isEmpty {
+            store.setupCommandTemplate = t(setupCommand)
+        }
+        store.createWorktree(
+            sourceRepo: repo,
+            ticket: t(ticket),
+            briefName: t(briefName),
+            baseBranch: base
+        )
         dismiss()
     }
 }
