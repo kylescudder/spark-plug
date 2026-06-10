@@ -21,77 +21,91 @@ private func relativeShort(_ date: Date) -> String {
 }
 
 struct ContentView: View {
-    @StateObject private var store = WorktreeStore()
+    @ObservedObject private var store = WorktreeStore.shared
     @State private var pendingNewSession: Worktree?
     @State private var sessionToDelete: ClaudeSession?
     @State private var worktreeToDelete: Worktree?
-    @State private var showNewWorktree = false
-    @Environment(\.openWindow) private var openWindow
+    /// Tracks the focus state of the hosting window. The menu-bar popover is an
+    /// NSPanel that becomes `.key` when opened and `.inactive` when dismissed —
+    /// so this flipping to `.key` is our "the menu was just opened" signal.
+    @Environment(\.controlActiveState) private var controlActiveState
 
     var body: some View {
-        VStack(spacing: 0) {
-            header
-            Divider()
-            if let msg = store.errorMessage {
-                Text(msg)
-                    .font(.callout)
-                    .foregroundStyle(.red)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal)
-                    .padding(.vertical, 6)
+        // Modals are rendered as in-view overlays, NOT .sheet/.confirmationDialog:
+        // buttons inside presented containers in a MenuBarExtra window render
+        // but never fire their actions (macOS bug). Inline views work.
+        ZStack {
+            VStack(spacing: 0) {
+                header
+                Divider()
+                if let msg = store.errorMessage {
+                    Text(msg)
+                        .font(.callout)
+                        .foregroundStyle(.red)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal)
+                        .padding(.vertical, 6)
+                }
+                list
+                Divider()
+                footer
             }
-            list
-            Divider()
-            footer
+            modalOverlay
         }
-        .sheet(item: $pendingNewSession) { wt in
-            NewSessionSheet(worktree: wt) { name in
-                store.launchClaude(in: wt, newSessionName: name)
-                store.scan()
-            }
+        .onChange(of: controlActiveState) { _, state in
+            // Auto-refresh whenever the window/popover regains focus — opening
+            // the menu-bar item re-scans without the user hitting Rescan.
+            if state == .key { store.scan() }
         }
-        .sheet(isPresented: $showNewWorktree) {
-            NewWorktreeSheet(store: store)
+    }
+
+    @ViewBuilder
+    private var modalOverlay: some View {
+        if isModalActive {
+            Color.black.opacity(0.35)
+                .onTapGesture { }  // swallow clicks behind the modal
+            Group {
+                if let wt = pendingNewSession {
+                    NewSessionCard(
+                        worktree: wt,
+                        onCancel: { pendingNewSession = nil }
+                    ) { name in
+                        store.launchClaude(in: wt, newSessionName: name)
+                        store.scan()
+                        pendingNewSession = nil
+                    }
+                } else if let session = sessionToDelete {
+                    let title = session.customTitle
+                        ?? session.firstMessage.map { $0.count > 40 ? String($0.prefix(40)) + "…" : $0 }
+                        ?? String(session.id.prefix(8))
+                    ConfirmDeleteCard(
+                        title: "Delete this session?",
+                        message: "This permanently deletes the transcript for “\(title)”. This can't be undone.",
+                        confirmLabel: "Delete",
+                        onConfirm: { store.deleteSession(session) },
+                        onDismiss: { sessionToDelete = nil }
+                    )
+                } else if let wt = worktreeToDelete {
+                    ConfirmDeleteCard(
+                        title: "Delete this worktree?",
+                        message: "This permanently deletes the folder “\(wt.name)” and everything in it. If it's a git worktree, any uncommitted changes are lost and its “\(wt.name)” branch is deleted too. This can't be undone.",
+                        confirmLabel: "Delete Worktree",
+                        onConfirm: { store.deleteWorktree(wt) },
+                        onDismiss: { worktreeToDelete = nil }
+                    )
+                } else if let launch = store.pendingTmuxLaunch {
+                    TmuxSessionPickerCard(launch: launch, store: store)
+                }
+            }
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+            .shadow(radius: 24)
+            .padding(24)
         }
-        .confirmationDialog(
-            "Delete this session?",
-            isPresented: Binding(
-                get: { sessionToDelete != nil },
-                set: { if !$0 { sessionToDelete = nil } }
-            ),
-            presenting: sessionToDelete
-        ) { session in
-            Button("Delete", role: .destructive) {
-                store.deleteSession(session)
-                sessionToDelete = nil
-            }
-            Button("Cancel", role: .cancel) {
-                sessionToDelete = nil
-            }
-        } message: { session in
-            let title = session.customTitle
-                ?? session.firstMessage.map { $0.count > 40 ? String($0.prefix(40)) + "…" : $0 }
-                ?? String(session.id.prefix(8))
-            Text("This permanently deletes the transcript for “\(title)”. This can't be undone.")
-        }
-        .confirmationDialog(
-            "Delete this worktree?",
-            isPresented: Binding(
-                get: { worktreeToDelete != nil },
-                set: { if !$0 { worktreeToDelete = nil } }
-            ),
-            presenting: worktreeToDelete
-        ) { wt in
-            Button("Delete Worktree", role: .destructive) {
-                store.deleteWorktree(wt)
-                worktreeToDelete = nil
-            }
-            Button("Cancel", role: .cancel) {
-                worktreeToDelete = nil
-            }
-        } message: { wt in
-            Text("This permanently deletes the folder “\(wt.name)” and everything in it. If it's a git worktree, any uncommitted changes are lost. This can't be undone.")
-        }
+    }
+
+    private var isModalActive: Bool {
+        pendingNewSession != nil || sessionToDelete != nil
+            || worktreeToDelete != nil || store.pendingTmuxLaunch != nil
     }
 
     private var footer: some View {
@@ -100,13 +114,6 @@ struct ContentView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
             Spacer()
-            Button {
-                openWindow(id: "main")
-                NSApp.activate(ignoringOtherApps: true)
-            } label: {
-                Label("Open Window", systemImage: "macwindow")
-            }
-            .buttonStyle(.borderless)
             Button {
                 NSApp.terminate(nil)
             } label: {
@@ -134,7 +141,7 @@ struct ContentView: View {
             }
             Spacer()
             Button {
-                showNewWorktree = true
+                NewWorktreePanel.shared.show()
             } label: {
                 Label("New Worktree", systemImage: "plus.rectangle.on.folder")
             }
@@ -306,11 +313,100 @@ struct ContentView: View {
     }
 }
 
-private struct NewSessionSheet: View {
+/// In-popover replacement for a destructive confirmationDialog. `onConfirm`
+/// returns whether the action succeeded; on failure the card stays open and
+/// shows the store's error so it can't vanish with the popover.
+private struct ConfirmDeleteCard: View {
+    let title: String
+    let message: String
+    let confirmLabel: String
+    let onConfirm: () -> Bool
+    let onDismiss: () -> Void
+
+    @State private var failureMessage: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 8) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.yellow)
+                Text(title).font(.headline)
+            }
+            Text(message)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if let failureMessage {
+                Label(failureMessage, systemImage: "xmark.octagon.fill")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            HStack {
+                Spacer()
+                Button("Cancel") { onDismiss() }
+                    .keyboardShortcut(.cancelAction)
+                Button(confirmLabel, role: .destructive) {
+                    if onConfirm() {
+                        onDismiss()
+                    } else {
+                        failureMessage = WorktreeStore.shared.errorMessage
+                            ?? "Delete failed for an unknown reason."
+                    }
+                }
+            }
+        }
+        .padding(20)
+        .frame(width: 400)
+    }
+}
+
+/// In-popover replacement for the tmux session confirmationDialog.
+private struct TmuxSessionPickerCard: View {
+    let launch: PendingTmuxLaunch
+    @ObservedObject var store: WorktreeStore
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 8) {
+                Image(systemName: "terminal")
+                    .foregroundStyle(.yellow)
+                Text("Which tmux session?").font(.headline)
+            }
+            Text("Multiple tmux sessions are running. Choose where to open the new Claude window.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            VStack(spacing: 6) {
+                ForEach(launch.sessionNames, id: \.self) { name in
+                    Button {
+                        store.completePendingLaunch(session: name)
+                    } label: {
+                        Text(name).frame(maxWidth: .infinity)
+                    }
+                }
+                Button {
+                    store.completePendingLaunch(session: nil)
+                } label: {
+                    Text("New tmux Session").frame(maxWidth: .infinity)
+                }
+            }
+            HStack {
+                Spacer()
+                Button("Cancel") { store.pendingTmuxLaunch = nil }
+                    .keyboardShortcut(.cancelAction)
+            }
+        }
+        .padding(20)
+        .frame(width: 400)
+    }
+}
+
+private struct NewSessionCard: View {
     let worktree: Worktree
+    let onCancel: () -> Void
     let onStart: (String) -> Void
 
-    @Environment(\.dismiss) private var dismiss
     @State private var name: String = ""
     @FocusState private var focused: Bool
 
@@ -334,7 +430,7 @@ private struct NewSessionSheet: View {
 
             HStack {
                 Spacer()
-                Button("Cancel", role: .cancel) { dismiss() }
+                Button("Cancel") { onCancel() }
                     .keyboardShortcut(.cancelAction)
                 Button("Start") { commit() }
                     .keyboardShortcut(.defaultAction)
@@ -354,13 +450,57 @@ private struct NewSessionSheet: View {
     private func commit() {
         guard !trimmed.isEmpty else { return }
         onStart(trimmed)
-        dismiss()
     }
 }
 
-private struct NewWorktreeSheet: View {
+/// Editable, autocompleting dropdown (NSComboBox) — type to filter, or pick
+/// from the repo's branches.
+private struct BranchComboBox: NSViewRepresentable {
+    @Binding var text: String
+    var items: [String]
+
+    func makeCoordinator() -> Coordinator { Coordinator(text: $text) }
+
+    func makeNSView(context: Context) -> NSComboBox {
+        let box = NSComboBox()
+        box.usesDataSource = false
+        box.completes = true
+        box.numberOfVisibleItems = 12
+        box.delegate = context.coordinator
+        return box
+    }
+
+    func updateNSView(_ box: NSComboBox, context: Context) {
+        let current = box.objectValues.compactMap { $0 as? String }
+        if current != items {
+            box.removeAllItems()
+            box.addItems(withObjectValues: items)
+        }
+        if box.stringValue != text {
+            box.stringValue = text
+        }
+    }
+
+    final class Coordinator: NSObject, NSComboBoxDelegate {
+        let text: Binding<String>
+        init(text: Binding<String>) { self.text = text }
+
+        func controlTextDidChange(_ notification: Notification) {
+            guard let box = notification.object as? NSComboBox else { return }
+            text.wrappedValue = box.stringValue
+        }
+
+        func comboBoxSelectionDidChange(_ notification: Notification) {
+            guard let box = notification.object as? NSComboBox,
+                  let value = box.objectValueOfSelectedItem as? String else { return }
+            text.wrappedValue = value
+        }
+    }
+}
+
+struct NewWorktreeForm: View {
     @ObservedObject var store: WorktreeStore
-    @Environment(\.dismiss) private var dismiss
+    let onClose: () -> Void
 
     @State private var sourceRepo: String = ""
     @State private var rememberDefault: Bool = false
@@ -369,6 +509,11 @@ private struct NewWorktreeSheet: View {
     @State private var baseBranch: String = "develop"
     @State private var showAdvanced = false
     @State private var setupCommand: String = ""
+    @State private var tmuxSessions: [String] = []
+    @State private var tmuxChoice: TmuxChoice = .automatic
+    @State private var branchOptions: [String] = []
+    @State private var branchError: String?
+    @State private var nameError: String?
     @FocusState private var ticketFocused: Bool
 
     var body: some View {
@@ -396,7 +541,7 @@ private struct NewWorktreeSheet: View {
 
             HStack(spacing: 10) {
                 VStack(alignment: .leading, spacing: 6) {
-                    Text("Ticket").font(.caption).foregroundStyle(.secondary)
+                    Text("Ticket (optional)").font(.caption).foregroundStyle(.secondary)
                     TextField("MP5-12345", text: $ticket)
                         .textFieldStyle(.roundedBorder)
                         .focused($ticketFocused)
@@ -407,11 +552,42 @@ private struct NewWorktreeSheet: View {
                         .textFieldStyle(.roundedBorder)
                 }
             }
+            if let err = nameError {
+                Label(err, systemImage: "exclamationmark.triangle")
+                    .font(.caption2)
+                    .foregroundStyle(.red)
+            }
 
             VStack(alignment: .leading, spacing: 6) {
                 Text("Base branch").font(.caption).foregroundStyle(.secondary)
-                TextField("develop", text: $baseBranch)
-                    .textFieldStyle(.roundedBorder)
+                BranchComboBox(text: $baseBranch, items: branchOptions)
+                    .frame(height: 24)
+                if let err = branchError {
+                    Label(err, systemImage: "exclamationmark.triangle")
+                        .font(.caption2)
+                        .foregroundStyle(.red)
+                }
+            }
+
+            if !t(sourceRepo).isEmpty && !willUseSetupScript {
+                Label("No setup script for this repo (or no ticket) — a plain `git worktree add` will be used.",
+                      systemImage: "info.circle")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+
+            if tmuxSessions.count > 1 {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("tmux session").font(.caption).foregroundStyle(.secondary)
+                    Picker("tmux session", selection: $tmuxChoice) {
+                        ForEach(tmuxSessions, id: \.self) { name in
+                            Text(name).tag(TmuxChoice.session(name))
+                        }
+                        Text("New session").tag(TmuxChoice.newSession)
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                }
             }
 
             DisclosureGroup("Advanced", isExpanded: $showAdvanced) {
@@ -428,7 +604,7 @@ private struct NewWorktreeSheet: View {
 
             HStack {
                 Spacer()
-                Button("Cancel", role: .cancel) { dismiss() }
+                Button("Cancel", role: .cancel) { onClose() }
                     .keyboardShortcut(.cancelAction)
                 Button("Start") { commit() }
                     .keyboardShortcut(.defaultAction)
@@ -442,7 +618,29 @@ private struct NewWorktreeSheet: View {
             sourceRepo = store.defaultSourceRepo
             rememberDefault = store.defaultSourceRepo.isEmpty
             setupCommand = store.setupCommandTemplate
+            tmuxSessions = store.tmuxSessionNames()
+            if let first = tmuxSessions.first, tmuxSessions.count > 1 {
+                tmuxChoice = .session(first)
+            }
+            loadBranches()
             ticketFocused = true
+        }
+        .onChange(of: sourceRepo) { loadBranches() }
+        .onChange(of: baseBranch) { branchError = nil }
+        .onChange(of: ticket) { nameError = nil }
+        .onChange(of: briefName) { nameError = nil }
+    }
+
+    /// Refreshes the branch dropdown for the current repo and defaults the
+    /// base to the first usual suspect that exists.
+    private func loadBranches() {
+        let repo = (t(sourceRepo) as NSString).expandingTildeInPath
+        branchOptions = store.branches(in: repo)
+        branchError = nil
+        if let preferred = ["develop", "main", "master"].first(where: branchOptions.contains) {
+            baseBranch = preferred
+        } else if let first = branchOptions.first {
+            baseBranch = first
         }
     }
 
@@ -451,13 +649,33 @@ private struct NewWorktreeSheet: View {
     }
 
     private var isValid: Bool {
-        !t(sourceRepo).isEmpty && !t(ticket).isEmpty && !t(briefName).isEmpty
+        !t(sourceRepo).isEmpty && !t(briefName).isEmpty
+    }
+
+    /// Mirrors the store's decision so the form can hint at the fallback.
+    private var willUseSetupScript: Bool {
+        store.willUseSetupScript(
+            repo: (t(sourceRepo) as NSString).expandingTildeInPath,
+            ticket: t(ticket)
+        )
     }
 
     private func commit() {
         guard isValid else { return }
         let repo = t(sourceRepo)
         let base = t(baseBranch).isEmpty ? "develop" : t(baseBranch)
+        let repoExpanded = (repo as NSString).expandingTildeInPath
+        guard store.branchExists(in: repoExpanded, branch: base) else {
+            branchError = "Branch “\(base)” doesn't exist in this repository."
+            return
+        }
+        // The fallback runs `git worktree add -b <name>`, which dies after the
+        // form is gone if the branch lingers — catch it here instead.
+        let dirName = t(ticket).isEmpty ? t(briefName) : "\(t(ticket))_\(t(briefName))"
+        if !willUseSetupScript, store.localBranchExists(in: repoExpanded, branch: dirName) {
+            nameError = "Branch “\(dirName)” already exists here — pick another name or delete that branch first."
+            return
+        }
         if rememberDefault { store.defaultSourceRepo = repo }
         if t(setupCommand) != store.setupCommandTemplate && !t(setupCommand).isEmpty {
             store.setupCommandTemplate = t(setupCommand)
@@ -466,8 +684,9 @@ private struct NewWorktreeSheet: View {
             sourceRepo: repo,
             ticket: t(ticket),
             briefName: t(briefName),
-            baseBranch: base
+            baseBranch: base,
+            tmuxChoice: tmuxChoice
         )
-        dismiss()
+        onClose()
     }
 }
