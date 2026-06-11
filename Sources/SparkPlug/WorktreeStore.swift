@@ -23,6 +23,17 @@ struct Worktree: Identifiable, Hashable {
     var hasClaudeSession: Bool { !sessions.isEmpty }
 }
 
+/// One section in the list: a base repo (registered and/or discovered from
+/// worktree `.git` pointers) and the worktrees that belong to it.
+struct ProjectGroup: Identifiable {
+    let name: String
+    /// Main repo path; nil only for the trailing "Other" group.
+    let path: String?
+    let isRegistered: Bool
+    let worktrees: [Worktree]
+    var id: String { path ?? name }
+}
+
 /// A launch waiting on the user to pick which tmux session to put it in.
 struct PendingTmuxLaunch: Identifiable {
     let id = UUID()
@@ -48,6 +59,7 @@ final class WorktreeStore: ObservableObject {
     private static let rootKey = "SparkPlug.rootPath"
     private static let sourceRepoKey = "SparkPlug.defaultSourceRepo"
     private static let setupCmdKey = "SparkPlug.setupCommandTemplate"
+    private static let reposKey = "SparkPlug.registeredRepos"
     static let defaultSetupCommand = "./scripts/mpro-worktree.sh {ticket} {brief} {base}"
 
     @Published var rootPath: String {
@@ -66,6 +78,12 @@ final class WorktreeStore: ObservableObject {
     @Published var setupCommandTemplate: String {
         didSet { UserDefaults.standard.set(setupCommandTemplate, forKey: Self.setupCmdKey) }
     }
+    /// Base repos the user has added; they appear as (possibly empty) project
+    /// groups. Repos are also discovered from existing worktrees' `.git`
+    /// pointers, so this list only needs to carry repos with no worktrees yet.
+    @Published var registeredRepos: [String] {
+        didSet { UserDefaults.standard.set(registeredRepos, forKey: Self.reposKey) }
+    }
     @Published private(set) var worktrees: [Worktree] = []
     @Published var errorMessage: String?
     /// Set when multiple tmux sessions exist and the user must choose one.
@@ -77,7 +95,66 @@ final class WorktreeStore: ObservableObject {
         self.defaultSourceRepo = UserDefaults.standard.string(forKey: Self.sourceRepoKey) ?? ""
         self.setupCommandTemplate = UserDefaults.standard.string(forKey: Self.setupCmdKey)
             ?? Self.defaultSetupCommand
+        self.registeredRepos = UserDefaults.standard.stringArray(forKey: Self.reposKey) ?? []
         scan()
+    }
+
+    /// Sections for the list: every registered repo plus every repo discovered
+    /// from worktrees, alphabetical, with non-git folders under "Other" last.
+    var projectGroups: [ProjectGroup] {
+        var byPath: [String: [Worktree]] = [:]
+        var others: [Worktree] = []
+        for wt in worktrees {
+            if let p = wt.projectPath {
+                byPath[p, default: []].append(wt)
+            } else {
+                others.append(wt)
+            }
+        }
+        let registered = Set(registeredRepos)
+        var groups = Set(byPath.keys).union(registered).map { path in
+            ProjectGroup(
+                name: URL(fileURLWithPath: path).lastPathComponent,
+                path: path,
+                isRegistered: registered.contains(path),
+                worktrees: byPath[path] ?? []
+            )
+        }
+        .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        if !others.isEmpty {
+            groups.append(ProjectGroup(
+                name: Worktree.otherProjectName, path: nil,
+                isRegistered: false, worktrees: others))
+        }
+        return groups
+    }
+
+    /// Folder picker that registers a base repo as a project group.
+    func addRepo() {
+        // The popover deactivates this accessory app as it closes, and an
+        // inactive app's open panel renders but ignores row selection.
+        NSApp.activate(ignoringOtherApps: true)
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Add"
+        panel.message = "Pick a base repository to manage worktrees for"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        guard FileManager.default.fileExists(
+            atPath: url.appendingPathComponent(".git").path) else {
+            errorMessage = "\(url.lastPathComponent) doesn't look like a git repository."
+            return
+        }
+        if !registeredRepos.contains(url.path) {
+            registeredRepos.append(url.path)
+        }
+    }
+
+    /// Forgets a registered repo. Disk is untouched; a repo with worktrees on
+    /// disk keeps appearing via discovery.
+    func removeRepo(_ path: String) {
+        registeredRepos.removeAll { $0 == path }
     }
 
     func scan() {
@@ -119,6 +196,7 @@ final class WorktreeStore: ObservableObject {
     }
 
     func pickFolder() {
+        NSApp.activate(ignoringOtherApps: true)
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
@@ -128,23 +206,6 @@ final class WorktreeStore: ObservableObject {
         if panel.runModal() == .OK, let url = panel.url {
             rootPath = url.path
         }
-    }
-
-    /// Folder picker for the source repo. Returns the chosen path (nil if
-    /// cancelled) so callers decide whether to also persist it as the default.
-    func pickSourceRepo(startingAt current: String) -> String? {
-        let panel = NSOpenPanel()
-        panel.canChooseDirectories = true
-        panel.canChooseFiles = false
-        panel.allowsMultipleSelection = false
-        panel.prompt = "Choose"
-        panel.message = "Pick the source repository to branch worktrees from"
-        let expanded = (current as NSString).expandingTildeInPath
-        if !expanded.isEmpty {
-            panel.directoryURL = URL(fileURLWithPath: expanded)
-        }
-        guard panel.runModal() == .OK, let url = panel.url else { return nil }
-        return url.path
     }
 
     /// Creates a worktree, then launches Claude *inside* it so its transcript
@@ -159,9 +220,7 @@ final class WorktreeStore: ObservableObject {
         tmuxChoice: TmuxChoice = .automatic
     ) {
         let repo = (sourceRepo as NSString).expandingTildeInPath
-        // Mirrors the setup script's target: <root>/<ticket>_<BriefName>,
-        // or just <BriefName> when there's no ticket.
-        let dirName = ticket.isEmpty ? briefName : "\(ticket)_\(briefName)"
+        let dirName = worktreeFolderName(repo: repo, ticket: ticket, brief: briefName)
         let rootExpanded = (rootPath as NSString).expandingTildeInPath
         let worktreePath = (rootExpanded as NSString).appendingPathComponent(dirName)
         let setupCmd: String
@@ -174,9 +233,65 @@ final class WorktreeStore: ObservableObject {
             setupCmd = "git worktree add -b \(singleQuote(dirName)) "
                 + "\(singleQuote(worktreePath)) \(singleQuote(baseBranch))"
         }
+        // Folder, tmux window, and Claude session share one label so a
+        // running session is identifiable from any of them. The script path
+        // names its own folder (ticket_brief), so the label adds the project
+        // prefix only where the folder couldn't carry it.
+        let repoName = URL(fileURLWithPath: repo).lastPathComponent
+        let label = dirName.hasPrefix("\(repoName)_") ? dirName : "\(repoName)_\(dirName)"
         let command = "cd \(singleQuote(repo)) && \(setupCmd) "
-            + "&& cd \(singleQuote(worktreePath)) && clear && claude"
-        launch(command, windowName: dirName, choice: tmuxChoice)
+            + "&& cd \(singleQuote(worktreePath)) && clear "
+            + "&& claude -n \(singleQuote(label))"
+        launch(command, windowName: label, choice: tmuxChoice)
+    }
+
+    /// Final folder/branch name for a new worktree. When the setup script
+    /// will run, its own convention (`<ticket>_<brief>`) is mirrored; the
+    /// plain `git worktree add` path prefixes the project name.
+    func worktreeFolderName(repo: String, ticket: String, brief: String) -> String {
+        let base = ticket.isEmpty ? brief : "\(ticket)_\(brief)"
+        if willUseSetupScript(repo: repo, ticket: ticket) { return base }
+        let repoName = URL(fileURLWithPath: repo).lastPathComponent
+        return base.hasPrefix("\(repoName)_") ? base : "\(repoName)_\(base)"
+    }
+
+    /// Project-header "New Worktree": just a name and an optional ticket —
+    /// the base branch is auto-picked and the name sanitised. Returns a
+    /// user-facing problem (shown inline in the card) instead of launching
+    /// when the name is invalid or its branch already exists.
+    @discardableResult
+    func createWorktree(repoPath: String, ticket: String, name: String) -> String? {
+        let brief = Self.sanitized(name)
+        let tick = ticket.trimmingCharacters(in: .whitespacesAndNewlines)
+        let dirName = worktreeFolderName(repo: repoPath, ticket: tick, brief: brief)
+        if let problem = worktreeNameProblem(dirName) { return problem }
+        if localBranchExists(in: repoPath, branch: dirName) {
+            return "Branch “\(dirName)” already exists — pick another name or delete that branch first."
+        }
+        createWorktree(
+            sourceRepo: repoPath,
+            ticket: tick,
+            briefName: brief,
+            baseBranch: defaultBaseBranch(in: repoPath)
+        )
+        return nil
+    }
+
+    /// develop → main → master → whatever HEAD points at.
+    func defaultBaseBranch(in repoPath: String) -> String {
+        for candidate in ["develop", "main", "master"]
+        where branchExists(in: repoPath, branch: candidate) {
+            return candidate
+        }
+        let head = runGit(["-C", repoPath, "symbolic-ref", "--short", "HEAD"])
+        return head.status == 0 && !head.output.isEmpty ? head.output : "main"
+    }
+
+    /// "Import/Export Groups" → "Import_Export_Groups" — a name safe for a
+    /// directory and a git branch. Dashes survive so repo names keep theirs.
+    static func sanitized(_ s: String) -> String {
+        let words = s.split { !$0.isLetter && !$0.isNumber && $0 != "-" }
+        return words.isEmpty ? "Session" : words.joined(separator: "_")
     }
 
     /// Whether the setup command will be used for `repo`: its executable must
@@ -209,6 +324,23 @@ final class WorktreeStore: ObservableObject {
                 branch + "^{commit}"]).status == 0
     }
 
+    /// Why `name` won't work as the worktree's branch/folder name, or nil
+    /// when it's fine. Slashes are rejected even though git allows them in
+    /// branches, because the name doubles as a single directory component.
+    func worktreeNameProblem(_ name: String) -> String? {
+        let suggestion = Self.sanitized(name)
+        if name.contains("/") {
+            return "“\(name)” can't contain “/” — it's also the folder name. Try “\(suggestion)”."
+        }
+        if name.contains(where: \.isWhitespace) {
+            return "Spaces aren't valid in a branch name. Try “\(suggestion)”."
+        }
+        if runGit(["check-ref-format", "--branch", name]).status != 0 {
+            return "“\(name)” isn't a valid git branch name. Try “\(suggestion)”."
+        }
+        return nil
+    }
+
     /// Whether a *local* branch with this exact name exists — used to catch
     /// `git worktree add -b` collisions before launching.
     func localBranchExists(in repoPath: String, branch: String) -> Bool {
@@ -239,17 +371,31 @@ final class WorktreeStore: ObservableObject {
     func launchClaude(
         in worktree: Worktree,
         resumeSessionId: String? = nil,
+        resumeTitle: String? = nil,
         newSessionName: String? = nil
     ) {
         var claudeCmd = "claude"
+        var sessionLabel: String?
         if let id = resumeSessionId {
             claudeCmd += " --resume \(singleQuote(id))"
+            sessionLabel = resumeTitle
         } else if let name = newSessionName?.trimmingCharacters(in: .whitespacesAndNewlines),
                   !name.isEmpty {
             claudeCmd += " -n \(singleQuote(name))"
+            sessionLabel = name
         }
         let command = "cd \(singleQuote(worktree.url.path)) && clear && \(claudeCmd)"
-        launch(command, windowName: worktree.name)
+        launch(command, windowName: windowName(worktree: worktree.name, session: sessionLabel))
+    }
+
+    /// "worktree — session" so several sessions in the same worktree stay
+    /// distinguishable in the tmux status bar (`-n` pins the name, so tmux
+    /// never renames it later); just the worktree name when there's no label.
+    private func windowName(worktree: String, session: String?) -> String {
+        guard let session = session?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !session.isEmpty else { return worktree }
+        let short = session.count > 24 ? String(session.prefix(24)) + "…" : session
+        return "\(worktree) — \(short)"
     }
 
     // MARK: - tmux
