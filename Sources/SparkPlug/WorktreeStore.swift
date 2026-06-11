@@ -12,8 +12,28 @@ struct Worktree: Identifiable, Hashable {
     var hasClaudeSession: Bool { sessionCount > 0 }
 }
 
+/// A launch waiting on the user to pick which tmux session to put it in.
+struct PendingTmuxLaunch: Identifiable {
+    let id = UUID()
+    let command: String
+    let windowName: String
+    let sessionNames: [String]
+}
+
+/// Where a launch should land in tmux. `.automatic` reuses a sole session,
+/// creates one if none exist, or defers to the user when several are running.
+enum TmuxChoice: Hashable {
+    case automatic
+    case newSession
+    case session(String)
+}
+
 @MainActor
 final class WorktreeStore: ObservableObject {
+    /// Single store shared by the window and menubar views so state (and
+    /// cross-view requests like `newWorktreeRequested`) stays in sync.
+    static let shared = WorktreeStore()
+
     private static let rootKey = "SparkPlug.rootPath"
     private static let sourceRepoKey = "SparkPlug.defaultSourceRepo"
     private static let setupCmdKey = "SparkPlug.setupCommandTemplate"
@@ -37,6 +57,8 @@ final class WorktreeStore: ObservableObject {
     }
     @Published private(set) var worktrees: [Worktree] = []
     @Published var errorMessage: String?
+    /// Set when multiple tmux sessions exist and the user must choose one.
+    @Published var pendingTmuxLaunch: PendingTmuxLaunch?
 
     init() {
         let defaultPath = ("~/worktrees" as NSString).expandingTildeInPath
@@ -113,27 +135,93 @@ final class WorktreeStore: ObservableObject {
         return url.path
     }
 
-    /// Creates a worktree by running the setup command in `sourceRepo`, then
-    /// launches Claude *inside* the new worktree so its transcript is associated
-    /// with the worktree (not the source repo). All chained in one Terminal.
+    /// Creates a worktree, then launches Claude *inside* it so its transcript
+    /// is associated with the worktree (not the source repo). Uses the repo's
+    /// setup command when it applies (see `willUseSetupScript`), otherwise a
+    /// plain `git worktree add`. All chained in one shell.
     func createWorktree(
         sourceRepo: String,
         ticket: String,
         briefName: String,
-        baseBranch: String
+        baseBranch: String,
+        tmuxChoice: TmuxChoice = .automatic
     ) {
         let repo = (sourceRepo as NSString).expandingTildeInPath
-        let setupCmd = setupCommandTemplate
-            .replacingOccurrences(of: "{ticket}", with: singleQuote(ticket))
-            .replacingOccurrences(of: "{brief}", with: singleQuote(briefName))
-            .replacingOccurrences(of: "{base}", with: singleQuote(baseBranch))
-        // Mirrors the setup script's target: <root>/<ticket>_<BriefName>.
+        // Mirrors the setup script's target: <root>/<ticket>_<BriefName>,
+        // or just <BriefName> when there's no ticket.
+        let dirName = ticket.isEmpty ? briefName : "\(ticket)_\(briefName)"
         let rootExpanded = (rootPath as NSString).expandingTildeInPath
-        let worktreePath = (rootExpanded as NSString)
-            .appendingPathComponent("\(ticket)_\(briefName)")
+        let worktreePath = (rootExpanded as NSString).appendingPathComponent(dirName)
+        let setupCmd: String
+        if willUseSetupScript(repo: repo, ticket: ticket) {
+            setupCmd = setupCommandTemplate
+                .replacingOccurrences(of: "{ticket}", with: singleQuote(ticket))
+                .replacingOccurrences(of: "{brief}", with: singleQuote(briefName))
+                .replacingOccurrences(of: "{base}", with: singleQuote(baseBranch))
+        } else {
+            setupCmd = "git worktree add -b \(singleQuote(dirName)) "
+                + "\(singleQuote(worktreePath)) \(singleQuote(baseBranch))"
+        }
         let command = "cd \(singleQuote(repo)) && \(setupCmd) "
             + "&& cd \(singleQuote(worktreePath)) && clear && claude"
-        runInTerminal(command)
+        launch(command, windowName: dirName, choice: tmuxChoice)
+    }
+
+    /// Whether the setup command will be used for `repo`: its executable must
+    /// exist there, and a ticket must be supplied if the template needs one.
+    func willUseSetupScript(repo: String, ticket: String) -> Bool {
+        guard !setupCommandTemplate.contains("{ticket}") || !ticket.isEmpty else {
+            return false
+        }
+        return setupScriptAvailable(in: repo)
+    }
+
+    /// Local branch names followed by remote-tracking ones (e.g.
+    /// `origin/develop`), deduplicated, `origin/HEAD` dropped. Empty when
+    /// `repoPath` isn't a git repo.
+    func branches(in repoPath: String) -> [String] {
+        guard !repoPath.isEmpty else { return [] }
+        let res = runGit(["-C", repoPath, "for-each-ref",
+                          "--format=%(refname:short)", "refs/heads", "refs/remotes"])
+        guard res.status == 0, !res.output.isEmpty else { return [] }
+        var seen = Set<String>()
+        return res.output.components(separatedBy: "\n")
+            .filter { !$0.hasSuffix("/HEAD") }
+            .filter { seen.insert($0).inserted }
+    }
+
+    /// Whether `branch` resolves to a commit in the repo (local branch,
+    /// remote-tracking branch, tag, or SHA).
+    func branchExists(in repoPath: String, branch: String) -> Bool {
+        runGit(["-C", repoPath, "rev-parse", "--verify", "--quiet",
+                branch + "^{commit}"]).status == 0
+    }
+
+    /// Whether a *local* branch with this exact name exists — used to catch
+    /// `git worktree add -b` collisions before launching.
+    func localBranchExists(in repoPath: String, branch: String) -> Bool {
+        runGit(["-C", repoPath, "show-ref", "--verify", "--quiet",
+                "refs/heads/" + branch]).status == 0
+    }
+
+    /// True when the setup command's executable can be found: an absolute (or
+    /// tilde) path is checked directly, a relative path is resolved against
+    /// the repo, and a bare command is assumed to be on PATH.
+    func setupScriptAvailable(in repoPath: String) -> Bool {
+        guard let first = setupCommandTemplate
+            .split(separator: " ", omittingEmptySubsequences: true).first else {
+            return false
+        }
+        let token = (String(first) as NSString).expandingTildeInPath
+        let fm = FileManager.default
+        if token.hasPrefix("/") {
+            return fm.isExecutableFile(atPath: token)
+        }
+        if token.contains("/") {
+            return fm.isExecutableFile(
+                atPath: (repoPath as NSString).appendingPathComponent(token))
+        }
+        return true
     }
 
     func launchClaude(
@@ -149,7 +237,104 @@ final class WorktreeStore: ObservableObject {
             claudeCmd += " -n \(singleQuote(name))"
         }
         let command = "cd \(singleQuote(worktree.url.path)) && clear && \(claudeCmd)"
-        runInTerminal(command)
+        launch(command, windowName: worktree.name)
+    }
+
+    // MARK: - tmux
+
+    /// Launches `command` in tmux when available: reuses the only running
+    /// session, creates one if none exist, or asks the user to pick when
+    /// several are running. Falls back to a plain Terminal window without tmux.
+    private func launch(_ command: String, windowName: String, choice: TmuxChoice = .automatic) {
+        guard tmuxPath != nil else {
+            runInTerminal(command)
+            return
+        }
+        switch choice {
+        case .session(let name):
+            launchInTmux(command, windowName: windowName, session: name)
+        case .newSession:
+            launchInTmux(command, windowName: windowName, session: nil)
+        case .automatic:
+            let sessions = tmuxSessionNames()
+            if sessions.count > 1 {
+                pendingTmuxLaunch = PendingTmuxLaunch(
+                    command: command, windowName: windowName, sessionNames: sessions)
+            } else {
+                launchInTmux(command, windowName: windowName, session: sessions.first)
+            }
+        }
+    }
+
+    /// Resolves a pending launch with the chosen session (nil = new session).
+    func completePendingLaunch(session: String?) {
+        guard let pending = pendingTmuxLaunch else { return }
+        pendingTmuxLaunch = nil
+        launchInTmux(pending.command, windowName: pending.windowName, session: session)
+    }
+
+    /// Opens a new tmux window in `session` (or a fresh session when nil) and
+    /// types `command` into its login shell — typing rather than passing the
+    /// command directly so the user's PATH (claude, nvm, etc.) is in effect.
+    private func launchInTmux(_ command: String, windowName: String, session: String?) {
+        guard let tmux = tmuxPath else {
+            runInTerminal(command)
+            return
+        }
+        let name = windowName.isEmpty ? "claude" : windowName
+        let sessionName: String
+        let created: (status: Int32, output: String)
+        var isNewSession = false
+        if let session {
+            sessionName = session
+            created = runProcess(tmux, ["new-window", "-t", "=\(session):",
+                                        "-n", name, "-P", "-F", "#{window_id}"])
+        } else {
+            sessionName = uniqueSessionName()
+            created = runProcess(tmux, ["new-session", "-d", "-s", sessionName,
+                                        "-n", name, "-P", "-F", "#{window_id}"])
+            isNewSession = true
+        }
+        guard created.status == 0, !created.output.isEmpty else {
+            errorMessage = "tmux failed: \(created.output)"
+            return
+        }
+        let windowId = created.output
+        runProcess(tmux, ["send-keys", "-t", windowId, "-l", command])
+        runProcess(tmux, ["send-keys", "-t", windowId, "Enter"])
+        // If nothing is viewing the session, attach it in a Terminal window.
+        if isNewSession || !isSessionAttached(sessionName) {
+            runInTerminal("\(tmux) attach -t \(singleQuote(sessionName))")
+        }
+    }
+
+    /// Names of running tmux sessions ([] when tmux/server isn't running).
+    func tmuxSessionNames() -> [String] {
+        guard let tmux = tmuxPath else { return [] }
+        let res = runProcess(tmux, ["list-sessions", "-F", "#{session_name}"])
+        guard res.status == 0, !res.output.isEmpty else { return [] }
+        return res.output.components(separatedBy: "\n")
+    }
+
+    private func isSessionAttached(_ name: String) -> Bool {
+        guard let tmux = tmuxPath else { return false }
+        let res = runProcess(tmux, ["display-message", "-p", "-t", "=\(name):",
+                                    "#{session_attached}"])
+        return res.status == 0 && (Int(res.output) ?? 0) > 0
+    }
+
+    private func uniqueSessionName() -> String {
+        let existing = Set(tmuxSessionNames())
+        if !existing.contains("spark-plug") { return "spark-plug" }
+        var i = 2
+        while existing.contains("spark-plug-\(i)") { i += 1 }
+        return "spark-plug-\(i)"
+    }
+
+    private var tmuxPath: String? {
+        ["/opt/homebrew/bin/tmux", "/usr/local/bin/tmux",
+         "/opt/local/bin/tmux", "/usr/bin/tmux"]
+            .first { FileManager.default.isExecutableFile(atPath: $0) }
     }
 
     /// Runs a shell command in a new Terminal window via AppleScript.
@@ -208,7 +393,9 @@ final class WorktreeStore: ObservableObject {
     /// intact — delete those separately if desired.
     @discardableResult
     func deleteWorktree(_ wt: Worktree) -> Bool {
+        Self.debugLog("deleteWorktree: \(wt.url.path)")
         if ClaudeProjects.sessions(for: wt.url).contains(where: { $0.isLive }) {
+            Self.debugLog("deleteWorktree blocked: live session in \(wt.name)")
             errorMessage = "Cannot delete — a live Claude session is running here. Quit it first."
             return false
         }
@@ -230,12 +417,21 @@ final class WorktreeStore: ObservableObject {
             }
             let mainTree = URL(fileURLWithPath: common.output)  // …/.git
                 .deletingLastPathComponent().path
+            // Capture the checked-out branch before the worktree disappears.
+            let head = runGit(["-C", wt.url.path, "symbolic-ref", "--short", "HEAD"])
             let res = runGit(["-C", mainTree, "worktree", "remove", "--force", wt.url.path])
             guard res.status == 0 else {
                 errorMessage = "git worktree remove failed: \(res.output)"
                 return false
             }
             runGit(["-C", mainTree, "worktree", "prune"])
+            // `git worktree remove` leaves the branch behind, which then
+            // blocks recreating a worktree with the same name. Only delete it
+            // when it matches the folder name (our naming convention) so a
+            // shared branch checked out here by hand is never torched.
+            if head.status == 0, head.output == wt.name {
+                runGit(["-C", mainTree, "branch", "-D", head.output])
+            }
             scan()
             return true
         } else {
@@ -253,8 +449,30 @@ final class WorktreeStore: ObservableObject {
     /// Runs git (Apple's CLT shim) and returns its exit status + combined output.
     @discardableResult
     private func runGit(_ args: [String]) -> (status: Int32, output: String) {
+        runProcess("/usr/bin/git", args)
+    }
+
+    /// Appends to ~/Library/Logs/SparkPlug.log. Plain file because os_log
+    /// entries weren't retrievable via `log show` on this system.
+    private static func debugLog(_ message: String) {
+        let url = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Logs/SparkPlug.log")
+        let stamp = ISO8601DateFormatter().string(from: Date())
+        guard let data = "[\(stamp)] \(message)\n".data(using: .utf8) else { return }
+        if let handle = try? FileHandle(forWritingTo: url) {
+            defer { try? handle.close() }
+            _ = try? handle.seekToEnd()
+            try? handle.write(contentsOf: data)
+        } else {
+            try? data.write(to: url)
+        }
+    }
+
+    /// Runs an executable and returns its exit status + combined, trimmed output.
+    @discardableResult
+    private func runProcess(_ path: String, _ args: [String]) -> (status: Int32, output: String) {
         let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        proc.executableURL = URL(fileURLWithPath: path)
         proc.arguments = args
         let pipe = Pipe()
         proc.standardOutput = pipe
@@ -263,11 +481,13 @@ final class WorktreeStore: ObservableObject {
             try proc.run()
             proc.waitUntilExit()
         } catch {
+            Self.debugLog("\(path) \(args.joined(separator: " ")) → spawn failed: \(error.localizedDescription)")
             return (-1, error.localizedDescription)
         }
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         let out = (String(data: data, encoding: .utf8) ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
+        Self.debugLog("\(path) \(args.joined(separator: " ")) → \(proc.terminationStatus) \(out)")
         return (proc.terminationStatus, out)
     }
 

@@ -4,7 +4,7 @@ set -euo pipefail
 APP_NAME="SparkPlug"          # Swift product / executable / icon base — no spaces
 DISPLAY_NAME="Spark Plug"     # User-facing name: bundle, Spotlight, dock
 BUNDLE_ID="uk.co.crimsontide.SparkPlug"
-VERSION="1.0.3"
+VERSION="1.0.4"
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 APP="$ROOT/$DISPLAY_NAME.app"
 
@@ -45,6 +45,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleShortVersionString</key>     <string>$VERSION</string>
     <key>CFBundleVersion</key>                <string>$VERSION</string>
     <key>LSMinimumSystemVersion</key>         <string>14.0</string>
+    <key>LSUIElement</key>                    <true/>
     <key>NSHighResolutionCapable</key>        <true/>
     <key>NSPrincipalClass</key>               <string>NSApplication</string>
     <key>NSAppleEventsUsageDescription</key>  <string>Spark Plug uses Apple Events to open Terminal in your selected worktree.</string>
