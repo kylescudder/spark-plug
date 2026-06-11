@@ -22,6 +22,9 @@ private func relativeShort(_ date: Date) -> String {
 
 struct ContentView: View {
     @ObservedObject private var store = WorktreeStore.shared
+    private static let collapsedKey = "SparkPlug.collapsedProjects"
+    @State private var collapsedProjects: Set<String> =
+        Set(UserDefaults.standard.stringArray(forKey: collapsedKey) ?? [])
     @State private var pendingNewSession: Worktree?
     @State private var sessionToDelete: ClaudeSession?
     @State private var worktreeToDelete: Worktree?
@@ -110,7 +113,7 @@ struct ContentView: View {
 
     private var footer: some View {
         HStack {
-            Text("\(store.worktrees.count) worktrees")
+            Text("\(store.worktrees.count) worktrees · \(groupedWorktrees.count) projects")
                 .font(.caption)
                 .foregroundStyle(.secondary)
             Spacer()
@@ -162,6 +165,17 @@ struct ContentView: View {
         .padding(12)
     }
 
+    /// Worktrees bucketed by source project, alphabetical, "Other" last.
+    private var groupedWorktrees: [(project: String, path: String?, items: [Worktree])] {
+        Dictionary(grouping: store.worktrees, by: { $0.projectName })
+            .map { (project: $0.key, path: $0.value.first?.projectPath, items: $0.value) }
+            .sorted {
+                if $0.project == Worktree.otherProjectName { return false }
+                if $1.project == Worktree.otherProjectName { return true }
+                return $0.project.localizedCaseInsensitiveCompare($1.project) == .orderedAscending
+            }
+    }
+
     private var list: some View {
         Group {
             if store.worktrees.isEmpty {
@@ -171,12 +185,80 @@ struct ContentView: View {
                     description: Text("Pick a folder containing subdirectories.")
                 )
             } else {
-                List(store.worktrees) { wt in
-                    row(for: wt)
+                // A plain VStack instead of List: NSTableView-backed Lists
+                // snap rather than animate conditional section content.
+                ScrollView {
+                    VStack(spacing: 0) {
+                        ForEach(groupedWorktrees, id: \.project) { group in
+                            projectHeader(group.project, path: group.path,
+                                          count: group.items.count)
+                            if !collapsedProjects.contains(group.project) {
+                                ForEach(group.items) { wt in
+                                    row(for: wt)
+                                        .padding(.horizontal, 12)
+                                    if wt.id != group.items.last?.id {
+                                        Divider().padding(.leading, 40)
+                                    }
+                                }
+                                .transition(.opacity)
+                            }
+                        }
+                    }
+                    .animation(.easeInOut(duration: 0.2), value: collapsedProjects)
+                    .padding(.vertical, 4)
                 }
-                .listStyle(.inset)
             }
         }
+    }
+
+    private func toggleCollapsed(_ name: String) {
+        if collapsedProjects.contains(name) {
+            collapsedProjects.remove(name)
+        } else {
+            collapsedProjects.insert(name)
+        }
+        UserDefaults.standard.set(Array(collapsedProjects), forKey: Self.collapsedKey)
+    }
+
+    @ViewBuilder
+    private func projectHeader(_ name: String, path: String?, count: Int) -> some View {
+        Button {
+            toggleCollapsed(name)
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: "chevron.right")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .rotationEffect(.degrees(collapsedProjects.contains(name) ? 0 : 90))
+                Image(systemName: name == Worktree.otherProjectName
+                      ? "folder" : "shippingbox.fill")
+                    .foregroundStyle(name == Worktree.otherProjectName
+                                     ? AnyShapeStyle(.secondary) : AnyShapeStyle(.yellow))
+                Text(name)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.primary)
+                Text("\(count)")
+                    .font(.caption2)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(Color.secondary.opacity(0.15), in: Capsule())
+                    .foregroundStyle(.secondary)
+                Spacer()
+                if let path {
+                    Text(path)
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .background(Color.secondary.opacity(0.07))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(path ?? name)
     }
 
     @ViewBuilder
@@ -235,7 +317,7 @@ struct ContentView: View {
 
     @ViewBuilder
     private func continueMenu(for wt: Worktree) -> some View {
-        let sessions = ClaudeProjects.sessions(for: wt.url)
+        let sessions = wt.sessions
         Menu {
             if sessions.isEmpty {
                 Text("No sessions yet")
@@ -277,17 +359,18 @@ struct ContentView: View {
         .help(sessions.isEmpty ? "No prior sessions" : "Resume an existing session")
     }
 
+    private func sessionTitle(_ s: ClaudeSession) -> String {
+        if let t = s.customTitle, !t.isEmpty { return t }
+        if let first = s.firstMessage, !first.isEmpty {
+            return first.count > 60 ? String(first.prefix(60)) + "…" : first
+        }
+        return String(s.id.prefix(8))
+    }
+
     private func sessionLabel(_ s: ClaudeSession) -> String {
         let when = relativeShort(s.lastModified)
-        let title: String = {
-            if let t = s.customTitle, !t.isEmpty { return t }
-            if let first = s.firstMessage, !first.isEmpty {
-                return first.count > 60 ? String(first.prefix(60)) + "…" : first
-            }
-            return String(s.id.prefix(8))
-        }()
         let live = s.isLive ? "● live · " : ""
-        return "\(live)\(title) · \(when)"
+        return "\(live)\(sessionTitle(s)) · \(when)"
     }
 
     @ViewBuilder

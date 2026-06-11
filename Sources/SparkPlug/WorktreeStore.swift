@@ -2,14 +2,25 @@ import SwiftUI
 import AppKit
 
 struct Worktree: Identifiable, Hashable {
+    /// Group name for directories that aren't git worktrees or repos.
+    static let otherProjectName = "Other"
+
     let id = UUID()
     let name: String
     let url: URL
     let isGitRepo: Bool
-    let sessionCount: Int
-    let lastSessionAt: Date?
+    /// Source project this worktree belongs to: the main repo's folder name
+    /// for a linked worktree, the folder's own name for a full clone, or
+    /// `otherProjectName` for plain directories.
+    let projectName: String
+    /// Path of the main repository (nil when not resolvable).
+    let projectPath: String?
+    /// Parsed at scan time (newest first) so view bodies never touch disk.
+    let sessions: [ClaudeSession]
 
-    var hasClaudeSession: Bool { sessionCount > 0 }
+    var sessionCount: Int { sessions.count }
+    var lastSessionAt: Date? { sessions.first?.lastModified }
+    var hasClaudeSession: Bool { !sessions.isEmpty }
 }
 
 /// A launch waiting on the user to pick which tmux session to put it in.
@@ -89,13 +100,14 @@ final class WorktreeStore: ObservableObject {
                 .filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false }
                 .map { dir in
                     let gitPath = dir.appendingPathComponent(".git").path
-                    let (count, last) = Self.claudeSessionInfo(for: dir)
+                    let project = Self.projectInfo(for: dir)
                     return Worktree(
                         name: dir.lastPathComponent,
                         url: dir,
                         isGitRepo: fm.fileExists(atPath: gitPath),
-                        sessionCount: count,
-                        lastSessionAt: last
+                        projectName: project.name,
+                        projectPath: project.path,
+                        sessions: ClaudeProjects.sessions(for: dir)
                     )
                 }
                 .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
@@ -500,22 +512,36 @@ final class WorktreeStore: ObservableObject {
          .replacingOccurrences(of: "\"", with: "\\\"")
     }
 
-    private static func claudeSessionInfo(for dir: URL) -> (count: Int, lastModified: Date?) {
-        let sessionDir = ClaudeProjects.sessionDir(for: dir)
+    /// Resolves which source project a directory belongs to without spawning
+    /// git: a linked worktree's `.git` *file* contains
+    /// `gitdir: <repo>/.git/worktrees/<name>`, so the repo folder is three
+    /// components up. A full clone (`.git` directory) is its own project.
+    private static func projectInfo(for dir: URL) -> (name: String, path: String?) {
         let fm = FileManager.default
+        let gitURL = dir.appendingPathComponent(".git")
         var isDir: ObjCBool = false
-        guard fm.fileExists(atPath: sessionDir.path, isDirectory: &isDir), isDir.boolValue else {
-            return (0, nil)
+        guard fm.fileExists(atPath: gitURL.path, isDirectory: &isDir) else {
+            return (Worktree.otherProjectName, nil)
         }
-        guard let entries = try? fm.contentsOfDirectory(
-            at: sessionDir,
-            includingPropertiesForKeys: [.contentModificationDateKey],
-            options: [.skipsHiddenFiles]
-        ) else { return (0, nil) }
-        let sessions = entries.filter { $0.pathExtension == "jsonl" }
-        let latest = sessions.compactMap {
-            try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
-        }.max()
-        return (sessions.count, latest)
+        if isDir.boolValue {
+            return (dir.lastPathComponent, dir.path)
+        }
+        guard let contents = try? String(contentsOf: gitURL, encoding: .utf8),
+              let line = contents.split(whereSeparator: \.isNewline)
+                  .first(where: { $0.hasPrefix("gitdir:") })
+        else { return (Worktree.otherProjectName, nil) }
+        let gitdir = line.dropFirst("gitdir:".count)
+            .trimmingCharacters(in: .whitespaces)
+        // gitdir may be relative to the worktree directory.
+        let gitdirURL = URL(fileURLWithPath: gitdir,
+                            relativeTo: dir).standardizedFileURL
+        let worktreesDir = gitdirURL.deletingLastPathComponent()
+        let dotGit = worktreesDir.deletingLastPathComponent()
+        guard worktreesDir.lastPathComponent == "worktrees",
+              dotGit.lastPathComponent == ".git"
+        else { return (Worktree.otherProjectName, nil) }
+        let repo = dotGit.deletingLastPathComponent()
+        return (repo.lastPathComponent, repo.path)
     }
+
 }
