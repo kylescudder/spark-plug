@@ -21,5 +21,12 @@ struct SparkPlugApp: App {
             Image(systemName: "bolt.fill")
         }
         .menuBarExtraStyle(.window)
+
+        // Settings live in a real window, not a popover overlay, so the page
+        // survives the popover auto-closing when focus moves elsewhere.
+        Window("Spark Plug Settings", id: "settings") {
+            SettingsCard(store: WorktreeStore.shared)
+        }
+        .windowResizability(.contentSize)
     }
 }
