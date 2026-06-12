@@ -60,7 +60,7 @@ final class WorktreeStore: ObservableObject {
     private static let sourceRepoKey = "SparkPlug.defaultSourceRepo"
     private static let setupCmdKey = "SparkPlug.setupCommandTemplate"
     private static let reposKey = "SparkPlug.registeredRepos"
-    static let defaultSetupCommand = "./scripts/mpro-worktree.sh {ticket} {brief} {base}"
+    static let defaultSetupCommand = "./scripts/setup-worktree.sh {ticket} {brief} {base}"
 
     @Published var rootPath: String {
         didSet {
@@ -196,16 +196,22 @@ final class WorktreeStore: ObservableObject {
     }
 
     func pickFolder() {
+        if let path = Self.promptForFolder(message: "Pick the folder that contains your worktrees") {
+            rootPath = path
+        }
+    }
+
+    /// Shows a directory-only open panel and returns the chosen path, if any.
+    static func promptForFolder(message: String) -> String? {
         NSApp.activate(ignoringOtherApps: true)
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = false
         panel.prompt = "Choose"
-        panel.message = "Pick the folder that contains your worktrees"
-        if panel.runModal() == .OK, let url = panel.url {
-            rootPath = url.path
-        }
+        panel.message = message
+        guard panel.runModal() == .OK, let url = panel.url else { return nil }
+        return url.path
     }
 
     /// Creates a worktree, then launches Claude *inside* it so its transcript
