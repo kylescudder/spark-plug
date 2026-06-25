@@ -29,6 +29,7 @@ struct ContentView: View {
     @State private var pendingNewWorktree: ProjectGroup?
     @State private var sessionToDelete: ClaudeSession?
     @State private var worktreeToDelete: Worktree?
+    @Environment(\.openWindow) private var openWindow
     /// Tracks the focus state of the hosting window. The menu-bar popover is an
     /// NSPanel that becomes `.key` when opened and `.inactive` when dismissed —
     /// so this flipping to `.key` is our "the menu was just opened" signal.
@@ -173,6 +174,15 @@ struct ContentView: View {
                 Label("Rescan", systemImage: "arrow.clockwise")
             }
             .keyboardShortcut("r", modifiers: .command)
+            Button {
+                openWindow(id: "settings")
+                // Accessory apps don't come forward on openWindow alone.
+                NSApp.activate(ignoringOtherApps: true)
+            } label: {
+                Label("Settings", systemImage: "gearshape")
+            }
+            .keyboardShortcut(",", modifiers: .command)
+            .help("View app version and edit settings")
         }
         .padding(12)
     }
