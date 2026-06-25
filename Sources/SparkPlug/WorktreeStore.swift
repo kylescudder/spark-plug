@@ -229,8 +229,9 @@ final class WorktreeStore: ObservableObject {
         let dirName = worktreeFolderName(repo: repo, ticket: ticket, brief: briefName)
         let rootExpanded = (rootPath as NSString).expandingTildeInPath
         let worktreePath = (rootExpanded as NSString).appendingPathComponent(dirName)
+        let useScript = willUseSetupScript(repo: repo, ticket: ticket)
         let setupCmd: String
-        if willUseSetupScript(repo: repo, ticket: ticket) {
+        if useScript {
             setupCmd = setupCommandTemplate
                 .replacingOccurrences(of: "{ticket}", with: singleQuote(ticket))
                 .replacingOccurrences(of: "{brief}", with: singleQuote(briefName))
@@ -239,13 +240,20 @@ final class WorktreeStore: ObservableObject {
             setupCmd = "git worktree add -b \(singleQuote(dirName)) "
                 + "\(singleQuote(worktreePath)) \(singleQuote(baseBranch))"
         }
+        // Provision from the worktree that has the base branch checked out, not
+        // the source repo: the setup script and the tools it invokes must come
+        // from the same commit the new worktree is branched from. Falls back to
+        // the source repo when the base isn't checked out anywhere.
+        let scriptDir = useScript
+            ? provisioningDir(sourceRepo: repo, baseBranch: baseBranch)
+            : repo
         // Folder, tmux window, and Claude session share one label so a
         // running session is identifiable from any of them. The script path
         // names its own folder (ticket_brief), so the label adds the project
         // prefix only where the folder couldn't carry it.
         let repoName = URL(fileURLWithPath: repo).lastPathComponent
         let label = dirName.hasPrefix("\(repoName)_") ? dirName : "\(repoName)_\(dirName)"
-        let command = "cd \(singleQuote(repo)) && \(setupCmd) "
+        let command = "cd \(singleQuote(scriptDir)) && \(setupCmd) "
             + "&& cd \(singleQuote(worktreePath)) && clear "
             + "&& claude -n \(singleQuote(label))"
         // Bring the base branch up to date with its remote *before* cutting the
@@ -415,6 +423,37 @@ final class WorktreeStore: ObservableObject {
     func localBranchExists(in repoPath: String, branch: String) -> Bool {
         runGit(["-C", repoPath, "show-ref", "--verify", "--quiet",
                 "refs/heads/" + branch]).status == 0
+    }
+
+    /// Directory the provisioning script should run from: the worktree that has
+    /// `baseBranch` checked out, so the script (and the tools it invokes) match
+    /// the commit the new worktree is branched from. Falls back to `sourceRepo`
+    /// when the base branch isn't checked out in its own worktree, or that
+    /// worktree doesn't carry the setup script.
+    func provisioningDir(sourceRepo: String, baseBranch: String) -> String {
+        guard let dir = worktreeDir(forBranch: baseBranch, in: sourceRepo),
+              dir != sourceRepo,
+              setupScriptAvailable(in: dir) else {
+            return sourceRepo
+        }
+        return dir
+    }
+
+    /// Absolute path of the worktree that currently has `branch` checked out, or
+    /// nil when none does (e.g. a remote-tracking or unborn branch). Parses
+    /// `git worktree list --porcelain`, matching `branch refs/heads/<branch>`.
+    func worktreeDir(forBranch branch: String, in repoPath: String) -> String? {
+        let res = runGit(["-C", repoPath, "worktree", "list", "--porcelain"])
+        guard res.status == 0 else { return nil }
+        var currentPath: String?
+        for line in res.output.components(separatedBy: "\n") {
+            if line.hasPrefix("worktree ") {
+                currentPath = String(line.dropFirst("worktree ".count))
+            } else if line == "branch refs/heads/\(branch)" {
+                return currentPath
+            }
+        }
+        return nil
     }
 
     /// True when the setup command's executable can be found: an absolute (or
