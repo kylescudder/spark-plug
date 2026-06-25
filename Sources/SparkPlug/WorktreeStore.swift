@@ -262,11 +262,18 @@ final class WorktreeStore: ObservableObject {
     }
 
     /// Project-header "New Worktree": just a name and an optional ticket —
-    /// the base branch is auto-picked and the name sanitised. Returns a
-    /// user-facing problem (shown inline in the card) instead of launching
-    /// when the name is invalid or its branch already exists.
+    /// the name is sanitised and, unless a `baseBranch` is supplied (e.g. the
+    /// branch of an existing worktree the user chose to fork from), the base
+    /// branch is auto-picked. Returns a user-facing problem (shown inline in
+    /// the card) instead of launching when the name is invalid or its branch
+    /// already exists.
     @discardableResult
-    func createWorktree(repoPath: String, ticket: String, name: String) -> String? {
+    func createWorktree(
+        repoPath: String,
+        ticket: String,
+        name: String,
+        baseBranch: String? = nil
+    ) -> String? {
         let brief = Self.sanitized(name)
         let tick = ticket.trimmingCharacters(in: .whitespacesAndNewlines)
         let dirName = worktreeFolderName(repo: repoPath, ticket: tick, brief: brief)
@@ -278,7 +285,7 @@ final class WorktreeStore: ObservableObject {
             sourceRepo: repoPath,
             ticket: tick,
             briefName: brief,
-            baseBranch: defaultBaseBranch(in: repoPath)
+            baseBranch: baseBranch ?? defaultBaseBranch(in: repoPath)
         )
         return nil
     }
@@ -321,6 +328,14 @@ final class WorktreeStore: ObservableObject {
         return res.output.components(separatedBy: "\n")
             .filter { !$0.hasSuffix("/HEAD") }
             .filter { seen.insert($0).inserted }
+    }
+
+    /// The branch checked out in a worktree (its HEAD), or nil when the head
+    /// is detached or the path isn't a git worktree. Used to offer an existing
+    /// worktree as the fork point for a new one.
+    func currentBranch(in path: String) -> String? {
+        let res = runGit(["-C", path, "symbolic-ref", "--short", "HEAD"])
+        return res.status == 0 && !res.output.isEmpty ? res.output : nil
     }
 
     /// Whether `branch` resolves to a commit in the repo (local branch,
