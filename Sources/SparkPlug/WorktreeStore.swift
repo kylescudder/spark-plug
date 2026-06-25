@@ -248,7 +248,55 @@ final class WorktreeStore: ObservableObject {
         let command = "cd \(singleQuote(repo)) && \(setupCmd) "
             + "&& cd \(singleQuote(worktreePath)) && clear "
             + "&& claude -n \(singleQuote(label))"
-        launch(command, windowName: label, choice: tmuxChoice)
+        // Bring the base branch up to date with its remote *before* cutting the
+        // worktree, off the main actor so the network I/O never freezes the UI.
+        // A clean refresh is silent; a stash reapply that conflicts surfaces via
+        // `errorMessage` (the launched terminal can't report back — `clear` and
+        // Claude take the screen). Either way the worktree is still created.
+        Task {
+            if let warning = await Task.detached(priority: .userInitiated, operation: {
+                Self.refreshBase(repo: repo, base: baseBranch)
+            }).value {
+                self.errorMessage = warning
+            }
+            self.launch(command, windowName: label, choice: tmuxChoice)
+        }
+    }
+
+    /// Brings `base` up to date with its remote in `repo`. Run off the main
+    /// actor — it performs network I/O. When `base` is the checked-out branch,
+    /// uncommitted work (tracked + untracked) is stashed across a fast-forward
+    /// pull and reapplied; when it isn't, the branch ref is fast-forwarded from
+    /// the remote directly. Returns a user-facing warning when the stash can't
+    /// be reapplied cleanly (the work is left in the tree *and* kept on the
+    /// stash, never dropped), otherwise nil. Every git step is best-effort: an
+    /// offline remote or a diverged branch is not reported and never blocks
+    /// creation.
+    nonisolated private static func refreshBase(repo: String, base: String) -> String? {
+        @discardableResult
+        func git(_ args: [String]) -> (status: Int32, output: String) {
+            runProcessSync("/usr/bin/git", ["-C", repo] + args)
+        }
+        let head = git(["symbolic-ref", "--short", "-q", "HEAD"])
+        guard head.status == 0, head.output == base else {
+            // Base isn't checked out: no working tree to preserve. Fast-forward
+            // its local ref straight from the remote.
+            git(["fetch", "origin"])
+            git(["fetch", "origin", "\(base):\(base)"])
+            return nil
+        }
+        // `stash push` exits non-zero when there's nothing to stash.
+        let didStash = git(["stash", "push", "-u", "-m", "spark-plug-autostash"]).status == 0
+        git(["pull", "--ff-only"])
+        guard didStash else { return nil }
+        if git(["stash", "pop"]).status != 0 {
+            let name = URL(fileURLWithPath: repo).lastPathComponent
+            return "Updated \(base), but reapplying your uncommitted changes in "
+                + "\(name) hit a conflict. They're preserved in the working tree "
+                + "and kept on the stash — open \(name) and resolve them "
+                + "(then `git stash drop`) before its next worktree."
+        }
+        return nil
     }
 
     /// Final folder/branch name for a new worktree. When the setup script
@@ -633,7 +681,7 @@ final class WorktreeStore: ObservableObject {
 
     /// Appends to ~/Library/Logs/SparkPlug.log. Plain file because os_log
     /// entries weren't retrievable via `log show` on this system.
-    private static func debugLog(_ message: String) {
+    nonisolated private static func debugLog(_ message: String) {
         let url = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Logs/SparkPlug.log")
         let stamp = ISO8601DateFormatter().string(from: Date())
@@ -650,6 +698,14 @@ final class WorktreeStore: ObservableObject {
     /// Runs an executable and returns its exit status + combined, trimmed output.
     @discardableResult
     private func runProcess(_ path: String, _ args: [String]) -> (status: Int32, output: String) {
+        Self.runProcessSync(path, args)
+    }
+
+    /// Actor-agnostic process runner so the background base-refresh can spawn
+    /// git off the main actor. Blocks the calling thread until the process exits.
+    nonisolated private static func runProcessSync(
+        _ path: String, _ args: [String]
+    ) -> (status: Int32, output: String) {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: path)
         proc.arguments = args
@@ -660,13 +716,13 @@ final class WorktreeStore: ObservableObject {
             try proc.run()
             proc.waitUntilExit()
         } catch {
-            Self.debugLog("\(path) \(args.joined(separator: " ")) → spawn failed: \(error.localizedDescription)")
+            debugLog("\(path) \(args.joined(separator: " ")) → spawn failed: \(error.localizedDescription)")
             return (-1, error.localizedDescription)
         }
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         let out = (String(data: data, encoding: .utf8) ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        Self.debugLog("\(path) \(args.joined(separator: " ")) → \(proc.terminationStatus) \(out)")
+        debugLog("\(path) \(args.joined(separator: " ")) → \(proc.terminationStatus) \(out)")
         return (proc.terminationStatus, out)
     }
 
