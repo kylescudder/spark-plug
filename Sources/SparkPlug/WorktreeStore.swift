@@ -293,8 +293,14 @@ final class WorktreeStore: ObservableObject {
             git(["fetch", "origin", "\(base):\(base)"])
             return nil
         }
-        // `stash push` exits non-zero when there's nothing to stash.
-        let didStash = git(["stash", "push", "-u", "-m", "spark-plug-autostash"]).status == 0
+        // `stash push` exits 0 both when it stashes and when there is nothing
+        // to stash ("No local changes to save"), so the exit code can't tell
+        // us whether a stash was created. Compare refs/stash instead: pop only
+        // a stash this refresh actually pushed — never a pre-existing entry
+        // the user is deliberately keeping.
+        let stashBefore = git(["rev-parse", "--verify", "--quiet", "refs/stash"]).output
+        git(["stash", "push", "-u", "-m", "spark-plug-autostash"])
+        let didStash = git(["rev-parse", "--verify", "--quiet", "refs/stash"]).output != stashBefore
         git(["pull", "--ff-only"])
         guard didStash else { return nil }
         if git(["stash", "pop"]).status != 0 {
