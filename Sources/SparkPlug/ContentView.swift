@@ -604,7 +604,8 @@ private struct NewSessionCard: View {
 /// Per-project worktree creation: a name plus optional ticket — the repo
 /// comes from the group, the fork point defaults to the branch checked out in
 /// the base repo (with a dropdown to branch off any local or remote branch
-/// instead), and folder, tmux window, and Claude session share one label.
+/// instead). The folder/branch and tmux window take the `ticket_brief` name;
+/// the Claude session takes just the descriptive name the user typed.
 private struct NewWorktreeCard: View {
     let group: ProjectGroup
     @ObservedObject var store: WorktreeStore
@@ -721,7 +722,7 @@ private struct NewWorktreeCard: View {
     private var preview: String {
         guard let path = group.path, !trimmed.isEmpty,
               let branch = selectedBranch else {
-            return "Folder, tmux window, and Claude session share one name."
+            return "Folder and tmux window take the ticket name; the Claude session takes yours."
         }
         let dir = store.worktreeFolderName(
             repo: path,

@@ -223,6 +223,7 @@ final class WorktreeStore: ObservableObject {
         ticket: String,
         briefName: String,
         baseBranch: String,
+        sessionName: String? = nil,
         tmuxChoice: TmuxChoice = .automatic
     ) {
         let repo = (sourceRepo as NSString).expandingTildeInPath
@@ -248,15 +249,15 @@ final class WorktreeStore: ObservableObject {
         let scriptDir = useScript
             ? provisioningDir(sourceRepo: repo, baseBranch: base)
             : repo
-        // Folder, tmux window, and Claude session share one label so a
-        // running session is identifiable from any of them. The script path
-        // names its own folder (ticket_brief), so the label adds the project
-        // prefix only where the folder couldn't carry it.
-        let repoName = URL(fileURLWithPath: repo).lastPathComponent
-        let label = dirName.hasPrefix("\(repoName)_") ? dirName : "\(repoName)_\(dirName)"
+        // The worktree folder names the tmux window, so a running session is
+        // identifiable from the folder it lives in. The Claude session takes
+        // just the descriptive name the user typed (the "final part"), never
+        // the ticket or project prefix the folder already carries.
+        let trimmedSession = (sessionName ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let claudeSession = trimmedSession.isEmpty ? briefName : trimmedSession
         let command = "cd \(singleQuote(scriptDir)) && \(setupCmd) "
             + "&& cd \(singleQuote(worktreePath)) && clear "
-            + "&& claude -n \(singleQuote(label))"
+            + "&& claude -n \(singleQuote(claudeSession))"
         // Bring the base branch up to date with its remote *before* cutting the
         // worktree, off the main actor so the network I/O never freezes the UI.
         // A clean refresh is silent; a stash reapply that conflicts surfaces via
@@ -268,7 +269,7 @@ final class WorktreeStore: ObservableObject {
             }).value {
                 self.errorMessage = warning
             }
-            self.launch(command, windowName: label, choice: tmuxChoice)
+            self.launch(command, windowName: dirName, choice: tmuxChoice)
         }
     }
 
@@ -348,7 +349,8 @@ final class WorktreeStore: ObservableObject {
             sourceRepo: repoPath,
             ticket: tick,
             briefName: brief,
-            baseBranch: baseBranch ?? defaultBaseBranch(in: repoPath)
+            baseBranch: baseBranch ?? defaultBaseBranch(in: repoPath),
+            sessionName: name.trimmingCharacters(in: .whitespacesAndNewlines)
         )
         return nil
     }
