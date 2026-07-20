@@ -601,19 +601,10 @@ private struct NewSessionCard: View {
     }
 }
 
-/// A starting point the new worktree can branch from: the base repo (its
-/// default branch) or an existing worktree (its checked-out branch).
-private struct WorktreeSource: Hashable {
-    /// Shown in the picker.
-    let label: String
-    /// git start-point passed to `git worktree add`.
-    let branch: String
-}
-
 /// Per-project worktree creation: a name plus optional ticket — the repo
-/// comes from the group, the fork point defaults to the base repo (with a
-/// dropdown to branch off an existing worktree instead), and folder, tmux
-/// window, and Claude session share one label.
+/// comes from the group, the fork point defaults to the branch checked out in
+/// the base repo (with a dropdown to branch off any local or remote branch
+/// instead), and folder, tmux window, and Claude session share one label.
 private struct NewWorktreeCard: View {
     let group: ProjectGroup
     @ObservedObject var store: WorktreeStore
@@ -623,8 +614,12 @@ private struct NewWorktreeCard: View {
     @State private var name: String = ""
     @State private var ticket: String = ""
     @State private var problem: String?
-    @State private var sources: [WorktreeSource] = []
-    @State private var selectedSource: WorktreeSource?
+    /// Every local and remote branch of the base repo (the fork-point choices).
+    @State private var branches: [String] = []
+    @State private var selectedBranch: String?
+    /// The branch checked out in the base repo — the default fork point, tagged
+    /// "(current)" in the picker.
+    @State private var currentBranch: String?
     @FocusState private var focused: Bool
 
     var body: some View {
@@ -658,14 +653,15 @@ private struct NewWorktreeCard: View {
                 }
             }
 
-            // Only worth a picker once there's at least one worktree to fork
-            // from; otherwise the lone "base repo" entry is just noise.
-            if sources.count > 1 {
+            // Only worth a picker once there's more than one branch to choose
+            // between; a lone branch is just used silently as the fork point.
+            if branches.count > 1 {
                 VStack(alignment: .leading, spacing: 6) {
                     Text("Branch from").font(.caption).foregroundStyle(.secondary)
-                    Picker("Branch from", selection: $selectedSource) {
-                        ForEach(sources, id: \.self) { src in
-                            Text(src.label).tag(src as WorktreeSource?)
+                    Picker("Branch from", selection: $selectedBranch) {
+                        ForEach(branches, id: \.self) { branch in
+                            Text(branch == currentBranch ? "\(branch) (current)" : branch)
+                                .tag(branch as String?)
                         }
                     }
                     .labelsHidden()
@@ -699,7 +695,7 @@ private struct NewWorktreeCard: View {
         .frame(width: 440)
         .onAppear {
             focused = true
-            buildSources()
+            buildBranches()
         }
         .onChange(of: name) { problem = nil }
         .onChange(of: ticket) { problem = nil }
@@ -709,38 +705,35 @@ private struct NewWorktreeCard: View {
         name.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    /// The base repo (its default branch) followed by every worktree in the
-    /// group that has a resolvable branch — the user's fork-point choices.
-    private func buildSources() {
+    /// Every local and remote branch of the base repo, defaulting the selection
+    /// to the branch it currently has checked out (falling back to the
+    /// conventional default, then the first branch listed).
+    private func buildBranches() {
         guard let path = group.path else { return }
-        var result = [WorktreeSource(
-            label: "\(group.name) (base repo)",
-            branch: store.defaultBaseBranch(in: path))]
-        for wt in group.worktrees where wt.isGitRepo {
-            if let branch = store.currentBranch(in: wt.url.path) {
-                result.append(WorktreeSource(label: wt.name, branch: branch))
-            }
-        }
-        sources = result
-        selectedSource = result.first
+        branches = store.branches(in: path)
+        let current = store.currentBranch(in: path)
+        currentBranch = current
+        selectedBranch = current.flatMap { branches.contains($0) ? $0 : nil }
+            ?? branches.first { $0 == store.defaultBaseBranch(in: path) }
+            ?? branches.first
     }
 
     private var preview: String {
         guard let path = group.path, !trimmed.isEmpty,
-              let source = selectedSource else {
+              let branch = selectedBranch else {
             return "Folder, tmux window, and Claude session share one name."
         }
         let dir = store.worktreeFolderName(
             repo: path,
             ticket: ticket.trimmingCharacters(in: .whitespacesAndNewlines),
             brief: WorktreeStore.sanitized(trimmed))
-        return "Creates “\(dir)” from \(source.branch)"
+        return "Creates “\(dir)” from \(branch)"
     }
 
     private func commit() {
         guard let path = group.path, !trimmed.isEmpty else { return }
         if let p = store.createWorktree(repoPath: path, ticket: ticket, name: trimmed,
-                                        baseBranch: selectedSource?.branch) {
+                                        baseBranch: selectedBranch) {
             problem = p
             return
         }
