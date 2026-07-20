@@ -226,6 +226,7 @@ final class WorktreeStore: ObservableObject {
         tmuxChoice: TmuxChoice = .automatic
     ) {
         let repo = (sourceRepo as NSString).expandingTildeInPath
+        let base = localBase(baseBranch, in: repo)
         let dirName = worktreeFolderName(repo: repo, ticket: ticket, brief: briefName)
         let rootExpanded = (rootPath as NSString).expandingTildeInPath
         let worktreePath = (rootExpanded as NSString).appendingPathComponent(dirName)
@@ -235,17 +236,17 @@ final class WorktreeStore: ObservableObject {
             setupCmd = setupCommandTemplate
                 .replacingOccurrences(of: "{ticket}", with: singleQuote(ticket))
                 .replacingOccurrences(of: "{brief}", with: singleQuote(briefName))
-                .replacingOccurrences(of: "{base}", with: singleQuote(baseBranch))
+                .replacingOccurrences(of: "{base}", with: singleQuote(base))
         } else {
             setupCmd = "git worktree add -b \(singleQuote(dirName)) "
-                + "\(singleQuote(worktreePath)) \(singleQuote(baseBranch))"
+                + "\(singleQuote(worktreePath)) \(singleQuote(base))"
         }
         // Provision from the worktree that has the base branch checked out, not
         // the source repo: the setup script and the tools it invokes must come
         // from the same commit the new worktree is branched from. Falls back to
         // the source repo when the base isn't checked out anywhere.
         let scriptDir = useScript
-            ? provisioningDir(sourceRepo: repo, baseBranch: baseBranch)
+            ? provisioningDir(sourceRepo: repo, baseBranch: base)
             : repo
         // Folder, tmux window, and Claude session share one label so a
         // running session is identifiable from any of them. The script path
@@ -263,7 +264,7 @@ final class WorktreeStore: ObservableObject {
         // Claude take the screen). Either way the worktree is still created.
         Task {
             if let warning = await Task.detached(priority: .userInitiated, operation: {
-                Self.refreshBase(repo: repo, base: baseBranch)
+                Self.refreshBase(repo: repo, base: base)
             }).value {
                 self.errorMessage = warning
             }
@@ -429,6 +430,28 @@ final class WorktreeStore: ObservableObject {
     func localBranchExists(in repoPath: String, branch: String) -> Bool {
         runGit(["-C", repoPath, "show-ref", "--verify", "--quiet",
                 "refs/heads/" + branch]).status == 0
+    }
+
+    /// Configured remote names (e.g. "origin"); empty when there are none or
+    /// `repoPath` isn't a git repo.
+    func remotes(in repoPath: String) -> [String] {
+        let res = runGit(["-C", repoPath, "remote"])
+        guard res.status == 0, !res.output.isEmpty else { return [] }
+        return res.output.components(separatedBy: "\n").filter { !$0.isEmpty }
+    }
+
+    /// The local branch a base selection maps to: a remote-tracking ref such as
+    /// "origin/develop" is reduced to "develop" when a matching local branch
+    /// exists, so branching from the remote behaves identically to branching
+    /// from the local branch — same worktree name, same setup-script naming.
+    /// Local names (including slashed ones like "feature/foo") and remote refs
+    /// with no local counterpart are returned unchanged so they still branch.
+    func localBase(_ base: String, in repoPath: String) -> String {
+        for remote in remotes(in: repoPath) where base.hasPrefix("\(remote)/") {
+            let local = String(base.dropFirst(remote.count + 1))
+            return localBranchExists(in: repoPath, branch: local) ? local : base
+        }
+        return base
     }
 
     /// Directory the provisioning script should run from: the worktree that has
