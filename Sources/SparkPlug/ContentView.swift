@@ -27,7 +27,7 @@ struct ContentView: View {
         Set(UserDefaults.standard.stringArray(forKey: collapsedKey) ?? [])
     @State private var pendingNewSession: Worktree?
     @State private var pendingNewWorktree: ProjectGroup?
-    @State private var sessionToDelete: ClaudeSession?
+    @State private var sessionToDelete: AgentSession?
     @State private var worktreeToDelete: Worktree?
     @Environment(\.openWindow) private var openWindow
     /// Tracks the focus state of the hosting window. The menu-bar popover is an
@@ -73,9 +73,11 @@ struct ContentView: View {
                 if let wt = pendingNewSession {
                     NewSessionCard(
                         worktree: wt,
+                        agent: store.agent(for: wt),
+                        windowNoun: store.multiplexer.windowNoun,
                         onCancel: { pendingNewSession = nil }
                     ) { name in
-                        store.launchClaude(in: wt, newSessionName: name)
+                        store.startSession(in: wt, agent: store.agent(for: wt), name: name)
                         store.scan()
                         pendingNewSession = nil
                     }
@@ -90,7 +92,7 @@ struct ContentView: View {
                         }
                     )
                 } else if let session = sessionToDelete {
-                    let title = session.customTitle
+                    let title = session.title
                         ?? session.firstMessage.map { $0.count > 40 ? String($0.prefix(40)) + "…" : $0 }
                         ?? String(session.id.prefix(8))
                     ConfirmDeleteCard(
@@ -108,8 +110,8 @@ struct ContentView: View {
                         onConfirm: { store.deleteWorktree(wt) },
                         onDismiss: { worktreeToDelete = nil }
                     )
-                } else if let launch = store.pendingTmuxLaunch {
-                    TmuxSessionPickerCard(launch: launch, store: store)
+                } else if let launch = store.pendingSessionLaunch {
+                    SessionPickerCard(launch: launch, store: store)
                 }
             }
             .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
@@ -121,7 +123,7 @@ struct ContentView: View {
     private var isModalActive: Bool {
         pendingNewSession != nil || pendingNewWorktree != nil
             || sessionToDelete != nil || worktreeToDelete != nil
-            || store.pendingTmuxLaunch != nil
+            || store.pendingSessionLaunch != nil
     }
 
     private var footer: some View {
@@ -288,23 +290,44 @@ struct ContentView: View {
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
-                .help("Create a new \(group.name) worktree and open Claude in it")
+                .help("Create a new \(group.name) worktree")
 
-                if group.isRegistered && group.worktrees.isEmpty {
-                    Menu {
+                Menu {
+                    Menu("Agent") {
+                        Picker("Agent", selection: Binding<Agent?>(
+                            get: { store.repoAgentOverride(forRepo: path) },
+                            set: { store.setRepoAgentOverride($0, forRepo: path) })) {
+                            Text("Inherit (\(store.defaultAgent.displayName))").tag(Agent?.none)
+                            ForEach(Agent.allCases) { a in
+                                Text(a.displayName).tag(Agent?.some(a))
+                            }
+                        }
+                    }
+                    Picker("Launch agent on start", selection: Binding<Bool?>(
+                        get: { store.repoOpenClaudeOverride(forRepo: path) },
+                        set: { store.setRepoOpenClaudeOverride($0, forRepo: path) })) {
+                        Text("Inherit (Global: \(store.openClaudeOnStartGlobal ? "On" : "Off"))")
+                            .tag(Bool?.none)
+                        Text("On").tag(Bool?.some(true))
+                        Text("Off").tag(Bool?.some(false))
+                    }
+                    // Forgetting a repo only makes sense once it has no worktrees
+                    // left to keep rediscovering it.
+                    if group.isRegistered && group.worktrees.isEmpty {
+                        Divider()
                         Button {
                             store.removeRepo(path)
                         } label: {
                             Label("Remove from list", systemImage: "minus.circle")
                         }
-                    } label: {
-                        Image(systemName: "ellipsis.circle")
                     }
-                    .menuStyle(.borderlessButton)
-                    .menuIndicator(.hidden)
-                    .fixedSize()
-                    .help("This only forgets the repo here — nothing on disk is touched")
+                } label: {
+                    Image(systemName: "ellipsis.circle")
                 }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .help("\(group.name) settings")
             }
         }
         .padding(.horizontal, 12)
@@ -323,7 +346,7 @@ struct ContentView: View {
                     Text(wt.url.path)
                         .lineLimit(1)
                         .truncationMode(.middle)
-                    if wt.hasClaudeSession {
+                    if wt.hasSessions {
                         sessionBadge(wt)
                     }
                 }
@@ -369,6 +392,9 @@ struct ContentView: View {
     @ViewBuilder
     private func continueMenu(for wt: Worktree) -> some View {
         let sessions = wt.sessions
+        // Show the agent name alongside each session only when the worktree
+        // has history from more than one agent.
+        let multiAgent = Set(sessions.map(\.agent)).count > 1
         Menu {
             if sessions.isEmpty {
                 Text("No sessions yet")
@@ -376,29 +402,31 @@ struct ContentView: View {
                 ForEach(sessions) { s in
                     Menu {
                         Button {
-                            store.launchClaude(in: wt, resumeSessionId: s.id,
-                                               resumeTitle: sessionTitle(s))
+                            store.resumeSession(s, in: wt)
                         } label: {
                             Label("Resume", systemImage: "arrow.uturn.forward")
                         }
-                        .disabled(s.isLive)
+                        .disabled(s.isLive || !s.agent.supportsResume)
 
-                        Button {
-                            store.revealSessionInFinder(s)
-                        } label: {
-                            Label("Show Transcript in Finder", systemImage: "doc.text.magnifyingglass")
+                        if s.canReveal {
+                            Button {
+                                store.revealSessionInFinder(s)
+                            } label: {
+                                Label("Show Transcript in Finder", systemImage: "doc.text.magnifyingglass")
+                            }
                         }
 
-                        Divider()
-
-                        Button(role: .destructive) {
-                            sessionToDelete = s
-                        } label: {
-                            Label("Delete…", systemImage: "trash")
+                        if s.canDelete {
+                            Divider()
+                            Button(role: .destructive) {
+                                sessionToDelete = s
+                            } label: {
+                                Label("Delete…", systemImage: "trash")
+                            }
+                            .disabled(s.isLive)
                         }
-                        .disabled(s.isLive)
                     } label: {
-                        Text(sessionLabel(s))
+                        Text(multiAgent ? "\(s.agent.displayName) · \(sessionLabel(s))" : sessionLabel(s))
                     }
                 }
             }
@@ -411,15 +439,15 @@ struct ContentView: View {
         .help(sessions.isEmpty ? "No prior sessions" : "Resume an existing session")
     }
 
-    private func sessionTitle(_ s: ClaudeSession) -> String {
-        if let t = s.customTitle, !t.isEmpty { return t }
+    private func sessionTitle(_ s: AgentSession) -> String {
+        if let t = s.title, !t.isEmpty { return t }
         if let first = s.firstMessage, !first.isEmpty {
             return first.count > 60 ? String(first.prefix(60)) + "…" : first
         }
         return String(s.id.prefix(8))
     }
 
-    private func sessionLabel(_ s: ClaudeSession) -> String {
+    private func sessionLabel(_ s: AgentSession) -> String {
         let when = relativeShort(s.lastModified)
         let live = s.isLive ? "● live · " : ""
         return "\(live)\(sessionTitle(s)) · \(when)"
@@ -444,7 +472,7 @@ struct ContentView: View {
         .padding(.vertical, 2)
         .background(Color.orange.opacity(0.18), in: Capsule())
         .foregroundStyle(.orange)
-        .help("\(wt.sessionCount) Claude session\(wt.sessionCount == 1 ? "" : "s") for this folder")
+        .help("\(wt.sessionCount) agent session\(wt.sessionCount == 1 ? "" : "s") for this folder")
     }
 }
 
@@ -496,39 +524,43 @@ private struct ConfirmDeleteCard: View {
     }
 }
 
-/// In-popover replacement for the tmux session confirmationDialog.
-private struct TmuxSessionPickerCard: View {
-    let launch: PendingTmuxLaunch
+/// In-popover session chooser, shown when several of the selected
+/// multiplexer's sessions are running at launch time.
+private struct SessionPickerCard: View {
+    let launch: PendingSessionLaunch
     @ObservedObject var store: WorktreeStore
+
+    private var name: String { store.multiplexer.displayName }
+    private var noun: String { store.multiplexer.windowNoun }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(spacing: 8) {
                 Image(systemName: "terminal")
                     .foregroundStyle(.yellow)
-                Text("Which tmux session?").font(.headline)
+                Text("Which \(name) session?").font(.headline)
             }
-            Text("Multiple tmux sessions are running. Choose where to open the new Claude window.")
+            Text("Multiple \(name) sessions are running. Choose where to open the new Claude \(noun).")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             VStack(spacing: 6) {
-                ForEach(launch.sessionNames, id: \.self) { name in
+                ForEach(launch.sessionNames, id: \.self) { session in
                     Button {
-                        store.completePendingLaunch(session: name)
+                        store.completePendingLaunch(session: session)
                     } label: {
-                        Text(name).frame(maxWidth: .infinity)
+                        Text(session).frame(maxWidth: .infinity)
                     }
                 }
                 Button {
                     store.completePendingLaunch(session: nil)
                 } label: {
-                    Text("New tmux Session").frame(maxWidth: .infinity)
+                    Text("New \(name) Session").frame(maxWidth: .infinity)
                 }
             }
             HStack {
                 Spacer()
-                Button("Cancel") { store.pendingTmuxLaunch = nil }
+                Button("Cancel") { store.pendingSessionLaunch = nil }
                     .keyboardShortcut(.cancelAction)
             }
         }
@@ -539,6 +571,10 @@ private struct TmuxSessionPickerCard: View {
 
 private struct NewSessionCard: View {
     let worktree: Worktree
+    /// The agent this session will start (drives the title).
+    let agent: Agent
+    /// What the selected multiplexer calls its container ("window"/"workspace").
+    let windowNoun: String
     let onCancel: () -> Void
     let onStart: (String) -> Void
 
@@ -550,7 +586,7 @@ private struct NewSessionCard: View {
             HStack(spacing: 8) {
                 Image(systemName: "sparkle")
                     .foregroundStyle(.yellow)
-                Text("New Claude session").font(.headline)
+                Text("New \(agent.displayName) session").font(.headline)
             }
             Text(worktree.url.path)
                 .font(.caption)
@@ -592,7 +628,7 @@ private struct NewSessionCard: View {
         guard !trimmed.isEmpty else {
             return "Starts a Claude session in this worktree."
         }
-        return "tmux window: “\(worktree.name) — \(trimmed)”"
+        return "\(windowNoun.capitalized): “\(worktree.name) — \(trimmed)”"
     }
 
     private func commit() {
@@ -604,8 +640,8 @@ private struct NewSessionCard: View {
 /// Per-project worktree creation: a name plus optional ticket — the repo
 /// comes from the group, the fork point defaults to the branch checked out in
 /// the base repo (with a dropdown to branch off any local or remote branch
-/// instead). The folder/branch and tmux window take the `ticket_brief` name;
-/// the Claude session takes just the descriptive name the user typed.
+/// instead). The folder/branch and the multiplexer's window/workspace take the
+/// `ticket_brief` name; the Claude session takes just the descriptive name.
 private struct NewWorktreeCard: View {
     let group: ProjectGroup
     @ObservedObject var store: WorktreeStore
@@ -621,6 +657,10 @@ private struct NewWorktreeCard: View {
     /// The branch checked out in the base repo — the default fork point, tagged
     /// "(current)" in the picker.
     @State private var currentBranch: String?
+    /// Agent + launch-on-start for this worktree, both seeded from the repo's
+    /// resolved defaults in `onAppear`, then overridable here for this one.
+    @State private var agent: Agent = .claude
+    @State private var openClaude: Bool = true
     @FocusState private var focused: Bool
 
     var body: some View {
@@ -670,6 +710,19 @@ private struct NewWorktreeCard: View {
                 }
             }
 
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Agent").font(.caption).foregroundStyle(.secondary)
+                Picker("Agent", selection: $agent) {
+                    ForEach(Agent.allCases) { a in Text(a.displayName).tag(a) }
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+            }
+
+            Toggle("Launch \(agent.displayName) on start", isOn: $openClaude)
+                .toggleStyle(.checkbox)
+                .font(.caption)
+
             Text(preview)
                 .font(.caption2)
                 .foregroundStyle(.secondary)
@@ -697,6 +750,8 @@ private struct NewWorktreeCard: View {
         .onAppear {
             focused = true
             buildBranches()
+            openClaude = group.path.map { store.openClaudeOnStart(forRepo: $0) } ?? true
+            agent = group.path.map { store.agent(forRepo: $0) } ?? store.defaultAgent
         }
         .onChange(of: name) { problem = nil }
         .onChange(of: ticket) { problem = nil }
@@ -722,19 +777,22 @@ private struct NewWorktreeCard: View {
     private var preview: String {
         guard let path = group.path, !trimmed.isEmpty,
               let branch = selectedBranch else {
-            return "Folder and tmux window take the ticket name; the Claude session takes yours."
+            return "Folder and \(store.multiplexer.windowNoun) take the ticket name; the \(agent.displayName) session takes yours."
         }
         let dir = store.worktreeFolderName(
             repo: path,
             ticket: ticket.trimmingCharacters(in: .whitespacesAndNewlines),
             brief: WorktreeStore.sanitized(trimmed))
-        return "Creates “\(dir)” from \(branch)"
+        return openClaude
+            ? "Creates “\(dir)” from \(branch)"
+            : "Creates “\(dir)” from \(branch) · opens a shell, no \(agent.displayName)"
     }
 
     private func commit() {
         guard let path = group.path, !trimmed.isEmpty else { return }
         if let p = store.createWorktree(repoPath: path, ticket: ticket, name: trimmed,
-                                        baseBranch: selectedBranch) {
+                                        baseBranch: selectedBranch, openClaude: openClaude,
+                                        agent: agent) {
             problem = p
             return
         }
