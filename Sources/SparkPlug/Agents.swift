@@ -100,11 +100,22 @@ struct AgentSession: Identifiable, Hashable {
     let title: String?
     let firstMessage: String?
     let lastModified: Date
+    /// True only when the agent's store can report liveness AND the session is
+    /// live. When `liveStateKnown` is false this is always false — "not known
+    /// live", which is NOT the same as "known not live".
     let isLive: Bool
+    /// Whether liveness could be determined at all. False for stores with no
+    /// liveness signal (e.g. OpenCode), so destructive ops can stay conservative.
+    let liveStateKnown: Bool
     let fileURL: URL?
 
     var canReveal: Bool { fileURL != nil }
     var canDelete: Bool { fileURL != nil }
+
+    /// A destructive op (delete worktree/session) must refuse when the session
+    /// is live, or when we can't confirm it isn't — never force-remove work an
+    /// agent might still be using.
+    var blocksDestruction: Bool { isLive || !liveStateKnown }
 }
 
 /// Reads (and, where possible, deletes) an agent's on-disk sessions.
@@ -166,7 +177,7 @@ struct OpenCodeSessionProvider: AgentSessionProvider {
             return AgentSession(
                 id: id, agent: .opencode, title: title, firstMessage: nil,
                 lastModified: Date(timeIntervalSince1970: seconds),
-                isLive: false, fileURL: nil)
+                isLive: false, liveStateKnown: false, fileURL: nil)
         }
     }
 
@@ -189,9 +200,15 @@ struct OpenCodeSessionProvider: AgentSessionProvider {
         proc.arguments = args
         let pipe = Pipe()
         proc.standardOutput = pipe
-        proc.standardError = Pipe()
-        do { try proc.run(); proc.waitUntilExit() } catch { return (-1, "") }
+        // Discard stderr to the null device rather than a pipe nobody drains —
+        // otherwise a chatty stderr could fill its own buffer and hang the process.
+        proc.standardError = FileHandle.nullDevice
+        do { try proc.run() } catch { return (-1, "") }
+        // Read stdout to EOF *before* waiting: a large JSON result would fill the
+        // ~64KB pipe buffer, and if we waited first sqlite3 would block writing,
+        // never exit, and freeze this (main-actor) call forever.
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        proc.waitUntilExit()
         return (proc.terminationStatus, String(data: data, encoding: .utf8) ?? "")
     }
 }

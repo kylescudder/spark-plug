@@ -77,6 +77,7 @@ enum ClaudeProjects {
                     firstMessage: parsed.firstMessage,
                     lastModified: mtime,
                     isLive: live.contains(id),
+                    liveStateKnown: true,
                     fileURL: url
                 )
             }

@@ -851,6 +851,57 @@ final class WorktreeStore: ObservableObject {
         }
     }
 
+    /// Directories that currently have a live agent, across every running Herdr
+    /// session. Herdr's `agents` array lists only detected, running agents, so
+    /// this is authoritative for *all* agent kinds — the runtime liveness signal
+    /// the session stores can't provide. Collects each agent's cwd/foreground
+    /// cwd and its workspace's worktree checkout path (over-inclusive on purpose,
+    /// so a destructive guard errs toward blocking). Called on demand, never in
+    /// `scan()`.
+    func herdrLiveAgentDirs() -> Set<String> {
+        guard let herdr = herdrPath else { return [] }
+        var dirs = Set<String>()
+        for session in herdrRunningSessionNames() {
+            let res = runProcess(herdr, ["--session", session, "api", "snapshot"])
+            guard res.status == 0, let data = res.output.data(using: .utf8),
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let result = obj["result"] as? [String: Any],
+                  let snapshot = result["snapshot"] as? [String: Any],
+                  let agents = snapshot["agents"] as? [[String: Any]] else { continue }
+            var checkoutByWorkspace: [String: String] = [:]
+            if let workspaces = snapshot["workspaces"] as? [[String: Any]] {
+                for ws in workspaces {
+                    if let id = ws["workspace_id"] as? String,
+                       let worktree = ws["worktree"] as? [String: Any],
+                       let path = worktree["checkout_path"] as? String {
+                        checkoutByWorkspace[id] = path
+                    }
+                }
+            }
+            for agent in agents {
+                if let d = agent["foreground_cwd"] as? String { dirs.insert(d) }
+                if let d = agent["cwd"] as? String { dirs.insert(d) }
+                if let id = agent["workspace_id"] as? String,
+                   let p = checkoutByWorkspace[id] { dirs.insert(p) }
+            }
+        }
+        return dirs
+    }
+
+    /// Whether an agent is currently running in `wt`, per the multiplexer's live
+    /// view — or nil when the multiplexer can't report it (tmux has no agent
+    /// state), leaving the caller to fall back to conservative session-based
+    /// guards. A directory matches when it is the worktree or a path inside it.
+    func worktreeHasLiveAgent(_ wt: Worktree) -> Bool? {
+        switch multiplexer {
+        case .tmux:
+            return nil
+        case .herdr:
+            let path = wt.url.path
+            return herdrLiveAgentDirs().contains { $0 == path || $0.hasPrefix(path + "/") }
+        }
+    }
+
     /// Opens a Herdr workspace for `command`. With a running `session` the
     /// workspace is created straight away; with nil (no session running, or the
     /// user asked for a new one) a Herdr client is launched in a terminal first
@@ -980,8 +1031,9 @@ final class WorktreeStore: ObservableObject {
     /// doesn't support deletion here.
     @discardableResult
     func deleteSession(_ session: AgentSession) -> Bool {
-        guard !session.isLive else {
-            errorMessage = "Cannot delete a live session — quit \(session.agent.displayName) first."
+        guard !session.blocksDestruction else {
+            errorMessage = "Cannot delete — quit \(session.agent.displayName) first "
+                + "(or Spark Plug can't confirm this session isn't running)."
             return false
         }
         guard session.agent.sessionProvider.deleteSession(session) else {
@@ -994,15 +1046,24 @@ final class WorktreeStore: ObservableObject {
 
     /// Permanently removes a worktree. For a real git worktree this runs
     /// `git worktree remove --force` (so the main repo's metadata is cleaned
-    /// up too); for a plain folder it deletes the directory. Refuses if a live
-    /// session is running in it. Claude transcripts under ~/.claude are left
-    /// intact — delete those separately if desired.
+    /// up too); for a plain folder it deletes the directory. Refuses when a
+    /// session is live, or when liveness can't be verified (e.g. OpenCode), so
+    /// `--force` never discards work an agent may still be using. Claude
+    /// transcripts under ~/.claude are left intact — delete those separately.
     @discardableResult
     func deleteWorktree(_ wt: Worktree) -> Bool {
         Self.debugLog("deleteWorktree: \(wt.url.path)")
-        if AgentSessions.all(for: wt.url).contains(where: { $0.isLive }) {
-            Self.debugLog("deleteWorktree blocked: live session in \(wt.name)")
-            errorMessage = "Cannot delete — a live Claude session is running here. Quit it first."
+        // Never force-remove a worktree an agent may still be using. Prefer the
+        // multiplexer's live view (authoritative for every agent kind); when it
+        // can't report (tmux), fall back to session state — treating a session
+        // whose liveness is unverifiable (e.g. OpenCode) as possibly-live.
+        let sessions = AgentSessions.all(for: wt.url)
+        let sessionsBlock = sessions.contains { $0.blocksDestruction }
+        if sessions.contains(where: { $0.isLive }) || (worktreeHasLiveAgent(wt) ?? sessionsBlock) {
+            Self.debugLog("deleteWorktree blocked: live/unverifiable agent in \(wt.name)")
+            errorMessage = "Cannot delete — an agent may be running here. Quit any sessions "
+                + "in this worktree first. If Spark Plug can't verify an agent's state and "
+                + "isn't managing it in Herdr, close it and retry, or remove the worktree from the terminal."
             return false
         }
         let fm = FileManager.default
@@ -1093,12 +1154,14 @@ final class WorktreeStore: ObservableObject {
         proc.standardError = pipe
         do {
             try proc.run()
-            proc.waitUntilExit()
         } catch {
             debugLog("\(path) \(args.joined(separator: " ")) → spawn failed: \(error.localizedDescription)")
             return (-1, error.localizedDescription)
         }
+        // Drain the (merged stdout+stderr) pipe to EOF before waiting, so large
+        // output can't fill the pipe buffer and deadlock the process.
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        proc.waitUntilExit()
         let out = (String(data: data, encoding: .utf8) ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         debugLog("\(path) \(args.joined(separator: " ")) → \(proc.terminationStatus) \(out)")
