@@ -16,11 +16,12 @@ struct Worktree: Identifiable, Hashable {
     /// Path of the main repository (nil when not resolvable).
     let projectPath: String?
     /// Parsed at scan time (newest first) so view bodies never touch disk.
-    let sessions: [ClaudeSession]
+    /// Merged across every agent, each session tagged with its own `agent`.
+    let sessions: [AgentSession]
 
     var sessionCount: Int { sessions.count }
     var lastSessionAt: Date? { sessions.first?.lastModified }
-    var hasClaudeSession: Bool { !sessions.isEmpty }
+    var hasSessions: Bool { !sessions.isEmpty }
 }
 
 /// One section in the list: a base repo (registered and/or discovered from
@@ -34,17 +35,44 @@ struct ProjectGroup: Identifiable {
     var id: String { path ?? name }
 }
 
-/// A launch waiting on the user to pick which tmux session to put it in.
-struct PendingTmuxLaunch: Identifiable {
+/// Terminal multiplexer Spark Plug launches Claude sessions into. Persisted in
+/// UserDefaults; `.tmux` is the default so existing installs are unchanged.
+enum Multiplexer: String, CaseIterable, Identifiable {
+    case tmux
+    case herdr
+
+    var id: String { rawValue }
+
+    /// User-facing name — tmux is lowercased by convention; Herdr is a product.
+    var displayName: String {
+        switch self {
+        case .tmux: return "tmux"
+        case .herdr: return "Herdr"
+        }
+    }
+
+    /// What this multiplexer calls the container a launch opens into — a tmux
+    /// "window" vs a Herdr "workspace" — used in the UI's preview copy.
+    var windowNoun: String {
+        switch self {
+        case .tmux: return "window"
+        case .herdr: return "workspace"
+        }
+    }
+}
+
+/// A launch waiting on the user to pick which session to put it in. Either
+/// multiplexer surfaces this when several sessions are running at once.
+struct PendingSessionLaunch: Identifiable {
     let id = UUID()
     let command: String
     let windowName: String
     let sessionNames: [String]
 }
 
-/// Where a launch should land in tmux. `.automatic` reuses a sole session,
-/// creates one if none exist, or defers to the user when several are running.
-enum TmuxChoice: Hashable {
+/// Where a launch should land. `.automatic` reuses a sole running session,
+/// starts one if none exist, or defers to the user when several are running.
+enum SessionChoice: Hashable {
     case automatic
     case newSession
     case session(String)
@@ -60,7 +88,16 @@ final class WorktreeStore: ObservableObject {
     private static let sourceRepoKey = "SparkPlug.defaultSourceRepo"
     private static let setupCmdKey = "SparkPlug.setupCommandTemplate"
     private static let reposKey = "SparkPlug.registeredRepos"
+    private static let multiplexerKey = "SparkPlug.multiplexer"
+    private static let openClaudeKey = "SparkPlug.openClaudeOnStartByRepo"
+    private static let openClaudeGlobalKey = "SparkPlug.openClaudeOnStartGlobal"
+    private static let agentKey = "SparkPlug.defaultAgent"
+    private static let agentByRepoKey = "SparkPlug.agentByRepo"
+    private static let agentByWorktreeKey = "SparkPlug.agentByWorktree"
     static let defaultSetupCommand = "./scripts/setup-worktree.sh {ticket} {brief} {base}"
+    /// The global default's initial value: create-and-launch Claude, the
+    /// behaviour before the setting existed.
+    static let defaultOpenClaudeOnStart = true
 
     @Published var rootPath: String {
         didSet {
@@ -84,10 +121,34 @@ final class WorktreeStore: ObservableObject {
     @Published var registeredRepos: [String] {
         didSet { UserDefaults.standard.set(registeredRepos, forKey: Self.reposKey) }
     }
+    /// Which terminal multiplexer new Claude sessions open into.
+    @Published var multiplexer: Multiplexer {
+        didSet { UserDefaults.standard.set(multiplexer.rawValue, forKey: Self.multiplexerKey) }
+    }
+    /// Global default (the root of the Global → Repo → Worktree chain) for
+    /// whether creating a worktree auto-launches Claude vs. leaving a ready shell.
+    @Published var openClaudeOnStartGlobal: Bool {
+        didSet { UserDefaults.standard.set(openClaudeOnStartGlobal, forKey: Self.openClaudeGlobalKey) }
+    }
+    /// Per-repo *override* of the global default, keyed by repo path. A missing
+    /// entry means the repo inherits the global value. Read via
+    /// `repoOpenClaudeOverride(forRepo:)`, resolved via `openClaudeOnStart(forRepo:)`.
+    @Published private var openClaudeOnStartByRepo: [String: Bool]
+    /// Global default agent — the root of the Global → Repo → Worktree chain.
+    @Published var defaultAgent: Agent {
+        didSet { UserDefaults.standard.set(defaultAgent.rawValue, forKey: Self.agentKey) }
+    }
+    /// Per-repo agent *override*, keyed by repo path; absent = inherit global.
+    @Published private var agentByRepo: [String: String]
+    /// The agent a specific worktree was created with, keyed by worktree path,
+    /// so "New session" and resume keep using it rather than the repo/global
+    /// default. Absent for worktrees Spark Plug didn't create (they infer their
+    /// agent from existing sessions instead).
+    @Published private var agentByWorktree: [String: String]
     @Published private(set) var worktrees: [Worktree] = []
     @Published var errorMessage: String?
-    /// Set when multiple tmux sessions exist and the user must choose one.
-    @Published var pendingTmuxLaunch: PendingTmuxLaunch?
+    /// Set when multiple sessions are running and the user must choose one.
+    @Published var pendingSessionLaunch: PendingSessionLaunch?
 
     init() {
         let defaultPath = ("~/worktrees" as NSString).expandingTildeInPath
@@ -96,6 +157,28 @@ final class WorktreeStore: ObservableObject {
         self.setupCommandTemplate = UserDefaults.standard.string(forKey: Self.setupCmdKey)
             ?? Self.defaultSetupCommand
         self.registeredRepos = UserDefaults.standard.stringArray(forKey: Self.reposKey) ?? []
+        self.multiplexer = UserDefaults.standard.string(forKey: Self.multiplexerKey)
+            .flatMap(Multiplexer.init(rawValue:)) ?? .tmux
+        self.openClaudeOnStartGlobal =
+            UserDefaults.standard.object(forKey: Self.openClaudeGlobalKey) as? Bool
+            ?? Self.defaultOpenClaudeOnStart
+        var openClaude: [String: Bool] = [:]
+        for (path, value) in UserDefaults.standard.dictionary(forKey: Self.openClaudeKey) ?? [:] {
+            if let flag = value as? Bool { openClaude[path] = flag }
+        }
+        self.openClaudeOnStartByRepo = openClaude
+        self.defaultAgent = UserDefaults.standard.string(forKey: Self.agentKey)
+            .flatMap(Agent.init(rawValue:)) ?? .claude
+        var agentRepos: [String: String] = [:]
+        for (path, value) in UserDefaults.standard.dictionary(forKey: Self.agentByRepoKey) ?? [:] {
+            if let raw = value as? String { agentRepos[path] = raw }
+        }
+        self.agentByRepo = agentRepos
+        var agentWorktrees: [String: String] = [:]
+        for (path, value) in UserDefaults.standard.dictionary(forKey: Self.agentByWorktreeKey) ?? [:] {
+            if let raw = value as? String { agentWorktrees[path] = raw }
+        }
+        self.agentByWorktree = agentWorktrees
         scan()
     }
 
@@ -157,6 +240,68 @@ final class WorktreeStore: ObservableObject {
         registeredRepos.removeAll { $0 == path }
     }
 
+    /// The repo's explicit override, or nil when it inherits the global default.
+    func repoOpenClaudeOverride(forRepo path: String) -> Bool? {
+        openClaudeOnStartByRepo[path]
+    }
+
+    /// Sets the repo override, or clears it (nil) to inherit the global default.
+    func setRepoOpenClaudeOverride(_ value: Bool?, forRepo path: String) {
+        if let value {
+            openClaudeOnStartByRepo[path] = value
+        } else {
+            openClaudeOnStartByRepo.removeValue(forKey: path)
+        }
+        UserDefaults.standard.set(openClaudeOnStartByRepo, forKey: Self.openClaudeKey)
+    }
+
+    /// The value a new worktree of `path` starts from — the repo override when
+    /// set, otherwise the global default. The per-worktree toggle seeds from this.
+    func openClaudeOnStart(forRepo path: String) -> Bool {
+        openClaudeOnStartByRepo[path] ?? openClaudeOnStartGlobal
+    }
+
+    /// The repo's explicit agent override, or nil when it inherits the global.
+    func repoAgentOverride(forRepo path: String) -> Agent? {
+        agentByRepo[path].flatMap(Agent.init(rawValue:))
+    }
+
+    /// Sets the repo's agent override, or clears it (nil) to inherit the global.
+    func setRepoAgentOverride(_ agent: Agent?, forRepo path: String) {
+        if let agent {
+            agentByRepo[path] = agent.rawValue
+        } else {
+            agentByRepo.removeValue(forKey: path)
+        }
+        UserDefaults.standard.set(agentByRepo, forKey: Self.agentByRepoKey)
+    }
+
+    /// The agent a new worktree of `path` uses — repo override, else global.
+    func agent(forRepo path: String) -> Agent {
+        repoAgentOverride(forRepo: path) ?? defaultAgent
+    }
+
+    /// The agent that was pinned to a specific worktree at creation, if any.
+    func worktreeAgentOverride(forWorktree path: String) -> Agent? {
+        agentByWorktree[path].flatMap(Agent.init(rawValue:))
+    }
+
+    /// Pins a worktree to the agent it was created with.
+    func setWorktreeAgent(_ agent: Agent, forWorktree path: String) {
+        agentByWorktree[path] = agent.rawValue
+        UserDefaults.standard.set(agentByWorktree, forKey: Self.agentByWorktreeKey)
+    }
+
+    /// The agent operating in an existing worktree, resolved in priority order:
+    /// the agent it was created with, then the agent of its most recent session
+    /// (so worktrees Spark Plug didn't create still resolve correctly), then the
+    /// repo override, then the global default.
+    func agent(for worktree: Worktree) -> Agent {
+        if let pinned = worktreeAgentOverride(forWorktree: worktree.url.path) { return pinned }
+        if let latest = worktree.sessions.first?.agent { return latest }
+        return worktree.projectPath.map { agent(forRepo: $0) } ?? defaultAgent
+    }
+
     func scan() {
         let fm = FileManager.default
         let expanded = (rootPath as NSString).expandingTildeInPath
@@ -184,7 +329,7 @@ final class WorktreeStore: ObservableObject {
                         isGitRepo: fm.fileExists(atPath: gitPath),
                         projectName: project.name,
                         projectPath: project.path,
-                        sessions: ClaudeProjects.sessions(for: dir)
+                        sessions: AgentSessions.all(for: dir)
                     )
                 }
                 .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
@@ -224,13 +369,18 @@ final class WorktreeStore: ObservableObject {
         briefName: String,
         baseBranch: String,
         sessionName: String? = nil,
-        tmuxChoice: TmuxChoice = .automatic
+        sessionChoice: SessionChoice = .automatic,
+        openClaude: Bool = true,
+        agent: Agent = .claude
     ) {
         let repo = (sourceRepo as NSString).expandingTildeInPath
         let base = localBase(baseBranch, in: repo)
         let dirName = worktreeFolderName(repo: repo, ticket: ticket, brief: briefName)
         let rootExpanded = (rootPath as NSString).expandingTildeInPath
         let worktreePath = (rootExpanded as NSString).appendingPathComponent(dirName)
+        // Pin this worktree to its agent so later "New session" / resume default
+        // to it, even when it differs from the repo/global default.
+        setWorktreeAgent(agent, forWorktree: worktreePath)
         let useScript = willUseSetupScript(repo: repo, ticket: ticket)
         let setupCmd: String
         if useScript {
@@ -249,15 +399,19 @@ final class WorktreeStore: ObservableObject {
         let scriptDir = useScript
             ? provisioningDir(sourceRepo: repo, baseBranch: base)
             : repo
-        // The worktree folder names the tmux window, so a running session is
-        // identifiable from the folder it lives in. The Claude session takes
-        // just the descriptive name the user typed (the "final part"), never
-        // the ticket or project prefix the folder already carries.
+        // The worktree folder names the multiplexer's window/workspace, so a
+        // running session is identifiable from the folder it lives in. The
+        // Claude session takes just the descriptive name the user typed (the
+        // "final part"), never the ticket or project prefix the folder carries.
         let trimmedSession = (sessionName ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        let claudeSession = trimmedSession.isEmpty ? briefName : trimmedSession
-        let command = "cd \(singleQuote(scriptDir)) && \(setupCmd) "
-            + "&& cd \(singleQuote(worktreePath)) && clear "
-            + "&& claude -n \(singleQuote(claudeSession))"
+        let sessionLabel = trimmedSession.isEmpty ? briefName : trimmedSession
+        // With the agent off, provision the worktree and drop the user at a
+        // ready shell in it; otherwise launch the agent as the final step.
+        var command = "cd \(singleQuote(scriptDir)) && \(setupCmd) "
+            + "&& cd \(singleQuote(worktreePath)) && clear"
+        if openClaude {
+            command += " && \(agent.newSessionCommand(name: sessionLabel))"
+        }
         // Bring the base branch up to date with its remote *before* cutting the
         // worktree, off the main actor so the network I/O never freezes the UI.
         // A clean refresh is silent; a stash reapply that conflicts surfaces via
@@ -269,7 +423,7 @@ final class WorktreeStore: ObservableObject {
             }).value {
                 self.errorMessage = warning
             }
-            self.launch(command, windowName: dirName, choice: tmuxChoice)
+            self.launch(command, windowName: dirName, choice: sessionChoice)
         }
     }
 
@@ -336,7 +490,9 @@ final class WorktreeStore: ObservableObject {
         repoPath: String,
         ticket: String,
         name: String,
-        baseBranch: String? = nil
+        baseBranch: String? = nil,
+        openClaude: Bool = true,
+        agent: Agent = .claude
     ) -> String? {
         let brief = Self.sanitized(name)
         let tick = ticket.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -350,7 +506,9 @@ final class WorktreeStore: ObservableObject {
             ticket: tick,
             briefName: brief,
             baseBranch: baseBranch ?? defaultBaseBranch(in: repoPath),
-            sessionName: name.trimmingCharacters(in: .whitespacesAndNewlines)
+            sessionName: name.trimmingCharacters(in: .whitespacesAndNewlines),
+            openClaude: openClaude,
+            agent: agent
         )
         return nil
     }
@@ -507,24 +665,25 @@ final class WorktreeStore: ObservableObject {
         return true
     }
 
-    func launchClaude(
-        in worktree: Worktree,
-        resumeSessionId: String? = nil,
-        resumeTitle: String? = nil,
-        newSessionName: String? = nil
-    ) {
-        var claudeCmd = "claude"
-        var sessionLabel: String?
-        if let id = resumeSessionId {
-            claudeCmd += " --resume \(singleQuote(id))"
-            sessionLabel = resumeTitle
-        } else if let name = newSessionName?.trimmingCharacters(in: .whitespacesAndNewlines),
-                  !name.isEmpty {
-            claudeCmd += " -n \(singleQuote(name))"
-            sessionLabel = name
+    /// Resumes a past session in the agent that created it. Surfaces a message
+    /// for agents whose resume isn't wired up yet rather than launching wrongly.
+    func resumeSession(_ session: AgentSession, in worktree: Worktree) {
+        guard let resume = session.agent.resumeCommand(sessionId: session.id) else {
+            errorMessage = "\(session.agent.displayName) can't be resumed from Spark Plug yet."
+            return
         }
-        let command = "cd \(singleQuote(worktree.url.path)) && clear && \(claudeCmd)"
-        launch(command, windowName: windowName(worktree: worktree.name, session: sessionLabel))
+        let command = "cd \(singleQuote(worktree.url.path)) && clear && \(resume)"
+        launch(command, windowName: windowName(worktree: worktree.name, session: session.title))
+    }
+
+    /// Starts a fresh session of `agent` in a worktree. The typed name labels
+    /// the session where the agent supports naming (Claude today) and always
+    /// labels the multiplexer window/workspace.
+    func startSession(in worktree: Worktree, agent: Agent, name: String?) {
+        let trimmed = name?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let command = "cd \(singleQuote(worktree.url.path)) && clear && "
+            + agent.newSessionCommand(name: trimmed)
+        launch(command, windowName: windowName(worktree: worktree.name, session: trimmed))
     }
 
     /// "worktree — session" so several sessions in the same worktree stay
@@ -537,38 +696,67 @@ final class WorktreeStore: ObservableObject {
         return "\(worktree) — \(short)"
     }
 
-    // MARK: - tmux
+    // MARK: - Launching
 
-    /// Launches `command` in tmux when available: reuses the only running
-    /// session, creates one if none exist, or asks the user to pick when
-    /// several are running. Falls back to a plain Terminal window without tmux.
-    private func launch(_ command: String, windowName: String, choice: TmuxChoice = .automatic) {
-        guard tmuxPath != nil else {
+    /// Launches `command` in the selected multiplexer: reuses the only running
+    /// session, starts one if none exist, or asks the user to pick when several
+    /// are running. Falls back to a plain Terminal window when the multiplexer
+    /// isn't installed.
+    private func launch(_ command: String, windowName: String, choice: SessionChoice = .automatic) {
+        guard multiplexerAvailable else {
             runInTerminal(command)
             return
         }
         switch choice {
         case .session(let name):
-            launchInTmux(command, windowName: windowName, session: name)
+            openInSession(command, windowName: windowName, session: name)
         case .newSession:
-            launchInTmux(command, windowName: windowName, session: nil)
+            openInSession(command, windowName: windowName, session: nil)
         case .automatic:
-            let sessions = tmuxSessionNames()
+            let sessions = runningSessionNames()
             if sessions.count > 1 {
-                pendingTmuxLaunch = PendingTmuxLaunch(
+                pendingSessionLaunch = PendingSessionLaunch(
                     command: command, windowName: windowName, sessionNames: sessions)
             } else {
-                launchInTmux(command, windowName: windowName, session: sessions.first)
+                openInSession(command, windowName: windowName, session: sessions.first)
             }
         }
     }
 
     /// Resolves a pending launch with the chosen session (nil = new session).
     func completePendingLaunch(session: String?) {
-        guard let pending = pendingTmuxLaunch else { return }
-        pendingTmuxLaunch = nil
-        launchInTmux(pending.command, windowName: pending.windowName, session: session)
+        guard let pending = pendingSessionLaunch else { return }
+        pendingSessionLaunch = nil
+        openInSession(pending.command, windowName: pending.windowName, session: session)
     }
+
+    /// Whether the selected multiplexer's binary is installed.
+    private var multiplexerAvailable: Bool {
+        switch multiplexer {
+        case .tmux: return tmuxPath != nil
+        case .herdr: return herdrPath != nil
+        }
+    }
+
+    /// Names of running sessions for the selected multiplexer — drives the
+    /// automatic reuse/ask logic and the session picker.
+    func runningSessionNames() -> [String] {
+        switch multiplexer {
+        case .tmux: return tmuxSessionNames()
+        case .herdr: return herdrRunningSessionNames()
+        }
+    }
+
+    /// Opens `command` in `session` (nil = start a new session) using the
+    /// selected multiplexer.
+    private func openInSession(_ command: String, windowName: String, session: String?) {
+        switch multiplexer {
+        case .tmux: launchInTmux(command, windowName: windowName, session: session)
+        case .herdr: launchInHerdr(command, windowName: windowName, session: session)
+        }
+    }
+
+    // MARK: - tmux
 
     /// Opens a new tmux window in `session` (or a fresh session when nil) and
     /// types `command` into its login shell — typing rather than passing the
@@ -634,6 +822,184 @@ final class WorktreeStore: ObservableObject {
             .first { FileManager.default.isExecutableFile(atPath: $0) }
     }
 
+    // MARK: - Herdr
+
+    private var herdrPath: String? {
+        [("~/.local/bin/herdr" as NSString).expandingTildeInPath,
+         "/opt/homebrew/bin/herdr", "/usr/local/bin/herdr",
+         "/opt/local/bin/herdr", "/usr/bin/herdr"]
+            .first { FileManager.default.isExecutableFile(atPath: $0) }
+    }
+
+    /// Names of *running* Herdr sessions ([] when none, or herdr is missing).
+    func herdrRunningSessionNames() -> [String] {
+        herdrSessions().filter { $0.running }.map { $0.name }
+    }
+
+    /// Parses the columnar `herdr session list` output — `name status directory
+    /// socket`, one row per session after a header — into (name, running) pairs.
+    /// Only the first two columns are read, so directory paths with spaces are
+    /// harmless.
+    private func herdrSessions() -> [(name: String, running: Bool)] {
+        guard let herdr = herdrPath else { return [] }
+        let res = runProcess(herdr, ["session", "list"])
+        guard res.status == 0 else { return [] }
+        return res.output.components(separatedBy: "\n").compactMap { line in
+            let cols = line.split(whereSeparator: \.isWhitespace)
+            guard cols.count >= 2, cols[0] != "name" else { return nil }  // skip header
+            return (String(cols[0]), cols[1] == "running")
+        }
+    }
+
+    /// Directories that currently have a live agent, across every running Herdr
+    /// session. Herdr's `agents` array lists only detected, running agents, so
+    /// this is authoritative for *all* agent kinds — the runtime liveness signal
+    /// the session stores can't provide. Collects each agent's cwd/foreground
+    /// cwd and its workspace's worktree checkout path (over-inclusive on purpose,
+    /// so a destructive guard errs toward blocking). Called on demand, never in
+    /// `scan()`.
+    func herdrLiveAgentDirs() -> Set<String> {
+        guard let herdr = herdrPath else { return [] }
+        var dirs = Set<String>()
+        for session in herdrRunningSessionNames() {
+            let res = runProcess(herdr, ["--session", session, "api", "snapshot"])
+            guard res.status == 0, let data = res.output.data(using: .utf8),
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let result = obj["result"] as? [String: Any],
+                  let snapshot = result["snapshot"] as? [String: Any],
+                  let agents = snapshot["agents"] as? [[String: Any]] else { continue }
+            var checkoutByWorkspace: [String: String] = [:]
+            if let workspaces = snapshot["workspaces"] as? [[String: Any]] {
+                for ws in workspaces {
+                    if let id = ws["workspace_id"] as? String,
+                       let worktree = ws["worktree"] as? [String: Any],
+                       let path = worktree["checkout_path"] as? String {
+                        checkoutByWorkspace[id] = path
+                    }
+                }
+            }
+            for agent in agents {
+                if let d = agent["foreground_cwd"] as? String { dirs.insert(d) }
+                if let d = agent["cwd"] as? String { dirs.insert(d) }
+                if let id = agent["workspace_id"] as? String,
+                   let p = checkoutByWorkspace[id] { dirs.insert(p) }
+            }
+        }
+        return dirs
+    }
+
+    /// Whether an agent is currently running in `wt`, per the multiplexer's live
+    /// view — or nil when the multiplexer can't report it (tmux has no agent
+    /// state), leaving the caller to fall back to conservative session-based
+    /// guards. A directory matches when it is the worktree or a path inside it.
+    func worktreeHasLiveAgent(_ wt: Worktree) -> Bool? {
+        switch multiplexer {
+        case .tmux:
+            return nil
+        case .herdr:
+            let path = wt.url.path
+            return herdrLiveAgentDirs().contains { $0 == path || $0.hasPrefix(path + "/") }
+        }
+    }
+
+    /// Opens a Herdr workspace for `command`. With a running `session` the
+    /// workspace is created straight away; with nil (no session running, or the
+    /// user asked for a new one) a Herdr client is launched in a terminal first
+    /// — Herdr can't create a session headlessly — then the workspace is opened
+    /// once its socket comes up. Mirrors the tmux launch flow.
+    private func launchInHerdr(_ command: String, windowName: String, session: String?) {
+        guard herdrPath != nil else {
+            runInTerminal(command)
+            return
+        }
+        if let session {
+            openHerdrWorkspace(command, windowName: windowName, session: session)
+        } else {
+            startHerdrSessionThenOpen(command, windowName: windowName)
+        }
+    }
+
+    /// Creates a workspace in `session`, then types `command` into its pane's
+    /// login shell and submits it — typing rather than passing the command
+    /// directly so the user's PATH (claude, nvm, etc.) is in effect, exactly as
+    /// the tmux path does. The workspace label mirrors the tmux window name.
+    private func openHerdrWorkspace(_ command: String, windowName: String, session: String) {
+        guard let herdr = herdrPath else {
+            runInTerminal(command)
+            return
+        }
+        let label = windowName.isEmpty ? "claude" : windowName
+        // `--focus` lands the user on the new workspace in Herdr, rather than
+        // leaving it to surface unnoticed behind the one they were viewing.
+        let created = runProcess(herdr, ["--session", session, "workspace", "create",
+                                         "--label", label, "--focus"])
+        guard created.status == 0,
+              let paneId = Self.herdrPaneId(fromCreateJSON: created.output) else {
+            errorMessage = "Herdr couldn't open a workspace: \(created.output)"
+            return
+        }
+        runProcess(herdr, ["--session", session, "pane", "send-text", paneId, command])
+        runProcess(herdr, ["--session", session, "pane", "send-keys", paneId, "Enter"])
+    }
+
+    /// Starts Herdr's `default` session (via a terminal, which both creates it
+    /// and attaches a viewer), waits off the main actor for its socket to come
+    /// up, then opens the workspace. If `default` is already running the wait is
+    /// skipped. Surfaces a warning if the session never comes up — the worktree
+    /// is created either way and can be opened in Herdr by hand.
+    private func startHerdrSessionThenOpen(_ command: String, windowName: String) {
+        let target = "default"
+        if herdrRunningSessionNames().contains(target) {
+            openHerdrWorkspace(command, windowName: windowName, session: target)
+            return
+        }
+        guard let herdr = herdrPath else {
+            runInTerminal(command)
+            return
+        }
+        runInTerminal(herdr)  // `herdr` with no --session launches the default session
+        Task {
+            let ready = await Task.detached(priority: .userInitiated) {
+                Self.waitForHerdrSession(herdr: herdr, name: target, attempts: 60)
+            }.value
+            if ready {
+                self.openHerdrWorkspace(command, windowName: windowName, session: target)
+            } else {
+                self.errorMessage = "Herdr didn't start in time — the worktree is "
+                    + "ready; open it in Herdr manually."
+            }
+        }
+    }
+
+    /// Polls `herdr session list` up to `attempts` times (0.25s apart) until
+    /// `name` reports `running`. Runs off the main actor.
+    nonisolated private static func waitForHerdrSession(
+        herdr: String, name: String, attempts: Int
+    ) -> Bool {
+        for _ in 0..<attempts {
+            let res = runProcessSync(herdr, ["session", "list"])
+            if res.status == 0 {
+                for line in res.output.components(separatedBy: "\n") {
+                    let cols = line.split(whereSeparator: \.isWhitespace)
+                    if cols.count >= 2, cols[0] == name, cols[1] == "running" { return true }
+                }
+            }
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        return false
+    }
+
+    /// Extracts `result.root_pane.pane_id` from `herdr workspace create`'s JSON.
+    nonisolated private static func herdrPaneId(fromCreateJSON json: String) -> String? {
+        guard let start = json.firstIndex(of: "{") else { return nil }
+        let data = Data(json[start...].utf8)
+        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let result = obj["result"] as? [String: Any],
+              let rootPane = result["root_pane"] as? [String: Any],
+              let paneId = rootPane["pane_id"] as? String else { return nil }
+        return paneId
+    }
+
     /// Runs a shell command in a new Terminal window via AppleScript.
     private func runInTerminal(_ command: String) {
         let source = """
@@ -655,45 +1021,49 @@ final class WorktreeStore: ObservableObject {
         NSWorkspace.shared.open(worktree.url)
     }
 
-    func revealSessionInFinder(_ session: ClaudeSession) {
-        NSWorkspace.shared.activateFileViewerSelecting([session.fileURL])
+    func revealSessionInFinder(_ session: AgentSession) {
+        guard let url = session.fileURL else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([url])
     }
 
-    /// Permanently deletes a session's `.jsonl` and its companion subagent
-    /// directory (if any). Refuses to act on a live session.
+    /// Permanently deletes a session's transcript via its agent's provider.
+    /// Refuses to act on a live session, and reports when an agent's store
+    /// doesn't support deletion here.
     @discardableResult
-    func deleteSession(_ session: ClaudeSession) -> Bool {
-        guard !session.isLive else {
-            errorMessage = "Cannot delete a live session — quit Claude first."
+    func deleteSession(_ session: AgentSession) -> Bool {
+        guard !session.blocksDestruction else {
+            errorMessage = "Cannot delete — quit \(session.agent.displayName) first "
+                + "(or Spark Plug can't confirm this session isn't running)."
             return false
         }
-        let fm = FileManager.default
-        do {
-            try fm.removeItem(at: session.fileURL)
-            let companion = session.fileURL.deletingLastPathComponent()
-                .appendingPathComponent(session.id, isDirectory: true)
-            if fm.fileExists(atPath: companion.path) {
-                try? fm.removeItem(at: companion)
-            }
-            scan()
-            return true
-        } catch {
-            errorMessage = "Failed to delete session: \(error.localizedDescription)"
+        guard session.agent.sessionProvider.deleteSession(session) else {
+            errorMessage = "Couldn't delete this \(session.agent.displayName) session."
             return false
         }
+        scan()
+        return true
     }
 
     /// Permanently removes a worktree. For a real git worktree this runs
     /// `git worktree remove --force` (so the main repo's metadata is cleaned
-    /// up too); for a plain folder it deletes the directory. Refuses if a live
-    /// session is running in it. Claude transcripts under ~/.claude are left
-    /// intact — delete those separately if desired.
+    /// up too); for a plain folder it deletes the directory. Refuses when a
+    /// session is live, or when liveness can't be verified (e.g. OpenCode), so
+    /// `--force` never discards work an agent may still be using. Claude
+    /// transcripts under ~/.claude are left intact — delete those separately.
     @discardableResult
     func deleteWorktree(_ wt: Worktree) -> Bool {
         Self.debugLog("deleteWorktree: \(wt.url.path)")
-        if ClaudeProjects.sessions(for: wt.url).contains(where: { $0.isLive }) {
-            Self.debugLog("deleteWorktree blocked: live session in \(wt.name)")
-            errorMessage = "Cannot delete — a live Claude session is running here. Quit it first."
+        // Never force-remove a worktree an agent may still be using. Prefer the
+        // multiplexer's live view (authoritative for every agent kind); when it
+        // can't report (tmux), fall back to session state — treating a session
+        // whose liveness is unverifiable (e.g. OpenCode) as possibly-live.
+        let sessions = AgentSessions.all(for: wt.url)
+        let sessionsBlock = sessions.contains { $0.blocksDestruction }
+        if sessions.contains(where: { $0.isLive }) || (worktreeHasLiveAgent(wt) ?? sessionsBlock) {
+            Self.debugLog("deleteWorktree blocked: live/unverifiable agent in \(wt.name)")
+            errorMessage = "Cannot delete — an agent may be running here. Quit any sessions "
+                + "in this worktree first. If Spark Plug can't verify an agent's state and "
+                + "isn't managing it in Herdr, close it and retry, or remove the worktree from the terminal."
             return false
         }
         let fm = FileManager.default
@@ -784,12 +1154,14 @@ final class WorktreeStore: ObservableObject {
         proc.standardError = pipe
         do {
             try proc.run()
-            proc.waitUntilExit()
         } catch {
             debugLog("\(path) \(args.joined(separator: " ")) → spawn failed: \(error.localizedDescription)")
             return (-1, error.localizedDescription)
         }
+        // Drain the (merged stdout+stderr) pipe to EOF before waiting, so large
+        // output can't fill the pipe buffer and deadlock the process.
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        proc.waitUntilExit()
         let out = (String(data: data, encoding: .utf8) ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         debugLog("\(path) \(args.joined(separator: " ")) → \(proc.terminationStatus) \(out)")

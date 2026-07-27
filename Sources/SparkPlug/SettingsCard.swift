@@ -9,6 +9,9 @@ struct SettingsCard: View {
 
     @State private var rootPath: String = ""
     @State private var setupCommand: String = ""
+    @State private var multiplexer: Multiplexer = .tmux
+    @State private var agent: Agent = .claude
+    @State private var openClaudeOnStart: Bool = true
 
     private var version: String {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev"
@@ -39,6 +42,43 @@ struct SettingsCard: View {
                         }
                     }
                 }
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Terminal multiplexer").font(.caption).foregroundStyle(.secondary)
+                Picker("Terminal multiplexer", selection: $multiplexer) {
+                    ForEach(Multiplexer.allCases) { m in
+                        Text(m.displayName).tag(m)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                Text("Where new Claude sessions open. Either reuses a running session, or asks when several are open.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Default agent").font(.caption).foregroundStyle(.secondary)
+                Picker("Default agent", selection: $agent) {
+                    ForEach(Agent.allCases) { a in Text(a.displayName).tag(a) }
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                Text("Which coding agent new worktrees launch. Repos and individual worktrees can override it.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                Toggle("Launch agent on start", isOn: $openClaudeOnStart)
+                    .toggleStyle(.checkbox)
+                Text("Global default for new worktrees. Repos and individual worktrees can override it; off leaves a ready shell instead.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
             VStack(alignment: .leading, spacing: 6) {
@@ -75,6 +115,9 @@ struct SettingsCard: View {
         .onAppear {
             rootPath = store.rootPath
             setupCommand = store.setupCommandTemplate
+            multiplexer = store.multiplexer
+            agent = store.defaultAgent
+            openClaudeOnStart = store.openClaudeOnStartGlobal
         }
     }
 
@@ -89,6 +132,15 @@ struct SettingsCard: View {
         }
         let cmd = setupCommand.trimmingCharacters(in: .whitespacesAndNewlines)
         store.setupCommandTemplate = cmd.isEmpty ? WorktreeStore.defaultSetupCommand : cmd
+        if multiplexer != store.multiplexer {
+            store.multiplexer = multiplexer
+        }
+        if agent != store.defaultAgent {
+            store.defaultAgent = agent
+        }
+        if openClaudeOnStart != store.openClaudeOnStartGlobal {
+            store.openClaudeOnStartGlobal = openClaudeOnStart
+        }
         dismiss()
     }
 }

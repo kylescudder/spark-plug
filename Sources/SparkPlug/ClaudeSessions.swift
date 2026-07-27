@@ -1,12 +1,28 @@
 import Foundation
 
-struct ClaudeSession: Identifiable, Hashable {
-    let id: String
-    let fileURL: URL
-    let customTitle: String?
-    let firstMessage: String?
-    let lastModified: Date
-    let isLive: Bool
+/// Claude Code's transcripts: one `.jsonl` per session under
+/// `~/.claude/projects/<encoded worktree path>/`.
+struct ClaudeSessionProvider: AgentSessionProvider {
+    func sessions(for worktree: URL) -> [AgentSession] {
+        ClaudeProjects.sessions(for: worktree)
+    }
+
+    /// Deletes the session's `.jsonl` and its companion subagent directory.
+    func deleteSession(_ session: AgentSession) -> Bool {
+        guard let url = session.fileURL else { return false }
+        let fm = FileManager.default
+        do {
+            try fm.removeItem(at: url)
+            let companion = url.deletingLastPathComponent()
+                .appendingPathComponent(session.id, isDirectory: true)
+            if fm.fileExists(atPath: companion.path) {
+                try? fm.removeItem(at: companion)
+            }
+            return true
+        } catch {
+            return false
+        }
+    }
 }
 
 enum ClaudeProjects {
@@ -37,7 +53,7 @@ enum ClaudeProjects {
             .map { $0.deletingPathExtension().lastPathComponent })
     }
 
-    static func sessions(for worktree: URL) -> [ClaudeSession] {
+    static func sessions(for worktree: URL) -> [AgentSession] {
         let dir = sessionDir(for: worktree)
         guard let entries = try? FileManager.default.contentsOfDirectory(
             at: dir,
@@ -49,18 +65,20 @@ enum ClaudeProjects {
 
         return entries
             .filter { $0.pathExtension == "jsonl" }
-            .map { url -> ClaudeSession in
+            .map { url -> AgentSession in
                 let mtime = (try? url.resourceValues(forKeys: [.contentModificationDateKey])
                     .contentModificationDate) ?? .distantPast
                 let id = url.deletingPathExtension().lastPathComponent
                 let parsed = parse(at: url)
-                return ClaudeSession(
+                return AgentSession(
                     id: id,
-                    fileURL: url,
-                    customTitle: parsed.title,
+                    agent: .claude,
+                    title: parsed.title,
                     firstMessage: parsed.firstMessage,
                     lastModified: mtime,
-                    isLive: live.contains(id)
+                    isLive: live.contains(id),
+                    liveStateKnown: true,
+                    fileURL: url
                 )
             }
             .sorted { $0.lastModified > $1.lastModified }
