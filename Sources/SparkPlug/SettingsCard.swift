@@ -9,6 +9,7 @@ struct SettingsCard: View {
 
     @State private var rootPath: String = ""
     @State private var setupCommand: String = ""
+    @State private var postStartScript: String = ""
     @State private var multiplexer: Multiplexer = .tmux
     @State private var agent: Agent = .claude
     @State private var openClaudeOnStart: Bool = true
@@ -100,6 +101,16 @@ struct SettingsCard: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Post-start script").font(.caption).foregroundStyle(.secondary)
+                TextField("bun dev", text: $postStartScript)
+                    .textFieldStyle(.roundedBorder)
+                Text("Global default, run inside the new worktree after setup and before the agent. Repos and individual worktrees can override it; leave empty to run nothing. {ticket}, {brief} and {base} are substituted — e.g. claude -n \"{ticket}-{brief}\" names a session even with no setup script.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
             HStack {
                 Spacer()
                 Button("Cancel") { dismiss() }
@@ -115,6 +126,7 @@ struct SettingsCard: View {
         .onAppear {
             rootPath = store.rootPath
             setupCommand = store.setupCommandTemplate
+            postStartScript = store.postStartScriptGlobal
             multiplexer = store.multiplexer
             agent = store.defaultAgent
             openClaudeOnStart = store.openClaudeOnStartGlobal
@@ -132,6 +144,10 @@ struct SettingsCard: View {
         }
         let cmd = setupCommand.trimmingCharacters(in: .whitespacesAndNewlines)
         store.setupCommandTemplate = cmd.isEmpty ? WorktreeStore.defaultSetupCommand : cmd
+        let postStart = postStartScript.trimmingCharacters(in: .whitespacesAndNewlines)
+        if postStart != store.postStartScriptGlobal {
+            store.postStartScriptGlobal = postStart
+        }
         if multiplexer != store.multiplexer {
             store.multiplexer = multiplexer
         }

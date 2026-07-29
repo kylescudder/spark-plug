@@ -87,6 +87,8 @@ final class WorktreeStore: ObservableObject {
     private static let rootKey = "SparkPlug.rootPath"
     private static let sourceRepoKey = "SparkPlug.defaultSourceRepo"
     private static let setupCmdKey = "SparkPlug.setupCommandTemplate"
+    private static let postStartGlobalKey = "SparkPlug.postStartScriptGlobal"
+    private static let postStartByRepoKey = "SparkPlug.postStartScriptByRepo"
     private static let reposKey = "SparkPlug.registeredRepos"
     private static let multiplexerKey = "SparkPlug.multiplexer"
     private static let openClaudeKey = "SparkPlug.openClaudeOnStartByRepo"
@@ -98,6 +100,9 @@ final class WorktreeStore: ObservableObject {
     /// The global default's initial value: create-and-launch Claude, the
     /// behaviour before the setting existed.
     static let defaultOpenClaudeOnStart = true
+    /// The post-start script's initial default: empty, i.e. run nothing, so
+    /// existing installs are unchanged.
+    static let defaultPostStartScript = ""
 
     @Published var rootPath: String {
         didSet {
@@ -115,6 +120,19 @@ final class WorktreeStore: ObservableObject {
     @Published var setupCommandTemplate: String {
         didSet { UserDefaults.standard.set(setupCommandTemplate, forKey: Self.setupCmdKey) }
     }
+    /// Global default (the root of the Global → Repo → Worktree chain) for the
+    /// script run *inside* a freshly created worktree, after provisioning and
+    /// before the agent launches. Empty means run nothing. Placeholders
+    /// {ticket} {brief} {base} are substituted verbatim (unquoted) so they can
+    /// be embedded in the user's own quoting — e.g. `claude -n "{ticket}-{brief}"`.
+    @Published var postStartScriptGlobal: String {
+        didSet { UserDefaults.standard.set(postStartScriptGlobal, forKey: Self.postStartGlobalKey) }
+    }
+    /// Per-repo *override* of the global post-start script, keyed by repo path.
+    /// A missing entry means the repo inherits the global value; a present entry
+    /// (even empty) overrides it. Read via `repoPostStartOverride(forRepo:)`,
+    /// resolved via `postStartScript(forRepo:)`.
+    @Published private var postStartScriptByRepo: [String: String]
     /// Base repos the user has added; they appear as (possibly empty) project
     /// groups. Repos are also discovered from existing worktrees' `.git`
     /// pointers, so this list only needs to carry repos with no worktrees yet.
@@ -156,6 +174,13 @@ final class WorktreeStore: ObservableObject {
         self.defaultSourceRepo = UserDefaults.standard.string(forKey: Self.sourceRepoKey) ?? ""
         self.setupCommandTemplate = UserDefaults.standard.string(forKey: Self.setupCmdKey)
             ?? Self.defaultSetupCommand
+        self.postStartScriptGlobal = UserDefaults.standard.string(forKey: Self.postStartGlobalKey)
+            ?? Self.defaultPostStartScript
+        var postStart: [String: String] = [:]
+        for (path, value) in UserDefaults.standard.dictionary(forKey: Self.postStartByRepoKey) ?? [:] {
+            if let script = value as? String { postStart[path] = script }
+        }
+        self.postStartScriptByRepo = postStart
         self.registeredRepos = UserDefaults.standard.stringArray(forKey: Self.reposKey) ?? []
         self.multiplexer = UserDefaults.standard.string(forKey: Self.multiplexerKey)
             .flatMap(Multiplexer.init(rawValue:)) ?? .tmux
@@ -259,6 +284,28 @@ final class WorktreeStore: ObservableObject {
     /// set, otherwise the global default. The per-worktree toggle seeds from this.
     func openClaudeOnStart(forRepo path: String) -> Bool {
         openClaudeOnStartByRepo[path] ?? openClaudeOnStartGlobal
+    }
+
+    /// The repo's explicit post-start script, or nil when it inherits the global.
+    func repoPostStartOverride(forRepo path: String) -> String? {
+        postStartScriptByRepo[path]
+    }
+
+    /// Sets the repo's post-start override, or clears it (nil) to inherit global.
+    func setRepoPostStartOverride(_ value: String?, forRepo path: String) {
+        if let value {
+            postStartScriptByRepo[path] = value
+        } else {
+            postStartScriptByRepo.removeValue(forKey: path)
+        }
+        UserDefaults.standard.set(postStartScriptByRepo, forKey: Self.postStartByRepoKey)
+    }
+
+    /// The post-start script a new worktree of `path` runs — the repo override
+    /// when set, otherwise the global default. The per-worktree field seeds
+    /// from this.
+    func postStartScript(forRepo path: String) -> String {
+        postStartScriptByRepo[path] ?? postStartScriptGlobal
     }
 
     /// The repo's explicit agent override, or nil when it inherits the global.
@@ -371,6 +418,7 @@ final class WorktreeStore: ObservableObject {
         sessionName: String? = nil,
         sessionChoice: SessionChoice = .automatic,
         openClaude: Bool = true,
+        postStartScript: String = "",
         agent: Agent = .claude
     ) {
         let repo = (sourceRepo as NSString).expandingTildeInPath
@@ -409,6 +457,20 @@ final class WorktreeStore: ObservableObject {
         // ready shell in it; otherwise launch the agent as the final step.
         var command = "cd \(singleQuote(scriptDir)) && \(setupCmd) "
             + "&& cd \(singleQuote(worktreePath)) && clear"
+        // Post-start script runs *inside* the new worktree, after provisioning
+        // and before the agent takes over the terminal. {ticket} {brief} {base}
+        // are substituted verbatim (unquoted) — unlike the setup command's args
+        // — so they can sit inside the user's own quoting, e.g.
+        // `claude -n "{ticket}-{brief}"` to name a session with no setup script.
+        // Empty means run nothing.
+        let postStart = postStartScript
+            .replacingOccurrences(of: "{ticket}", with: ticket)
+            .replacingOccurrences(of: "{brief}", with: briefName)
+            .replacingOccurrences(of: "{base}", with: base)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !postStart.isEmpty {
+            command += " && \(postStart)"
+        }
         if openClaude {
             command += " && \(agent.newSessionCommand(name: sessionLabel))"
         }
@@ -492,6 +554,7 @@ final class WorktreeStore: ObservableObject {
         name: String,
         baseBranch: String? = nil,
         openClaude: Bool = true,
+        postStartScript: String = "",
         agent: Agent = .claude
     ) -> String? {
         let brief = Self.sanitized(name)
@@ -508,6 +571,7 @@ final class WorktreeStore: ObservableObject {
             baseBranch: baseBranch ?? defaultBaseBranch(in: repoPath),
             sessionName: name.trimmingCharacters(in: .whitespacesAndNewlines),
             openClaude: openClaude,
+            postStartScript: postStartScript,
             agent: agent
         )
         return nil
