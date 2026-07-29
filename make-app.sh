@@ -4,7 +4,7 @@ set -euo pipefail
 APP_NAME="SparkPlug"          # Swift product / executable / icon base — no spaces
 DISPLAY_NAME="Spark Plug"     # User-facing name: bundle, Spotlight, dock
 BUNDLE_ID="co.uk.kylescudder.spark-plug"
-VERSION="1.8.0"
+VERSION="1.9.0"
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 APP="$ROOT/$DISPLAY_NAME.app"
 

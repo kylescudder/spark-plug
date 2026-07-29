@@ -89,9 +89,11 @@ final class WorktreeStore: ObservableObject {
     private static let setupCmdKey = "SparkPlug.setupCommandTemplate"
     private static let postStartGlobalKey = "SparkPlug.postStartScriptGlobal"
     private static let postStartByRepoKey = "SparkPlug.postStartScriptByRepo"
+    private static let postStartByWorktreeKey = "SparkPlug.postStartScriptByWorktree"
     private static let reposKey = "SparkPlug.registeredRepos"
     private static let multiplexerKey = "SparkPlug.multiplexer"
     private static let openClaudeKey = "SparkPlug.openClaudeOnStartByRepo"
+    private static let openClaudeByWorktreeKey = "SparkPlug.openClaudeOnStartByWorktree"
     private static let openClaudeGlobalKey = "SparkPlug.openClaudeOnStartGlobal"
     private static let agentKey = "SparkPlug.defaultAgent"
     private static let agentByRepoKey = "SparkPlug.agentByRepo"
@@ -133,6 +135,11 @@ final class WorktreeStore: ObservableObject {
     /// (even empty) overrides it. Read via `repoPostStartOverride(forRepo:)`,
     /// resolved via `postStartScript(forRepo:)`.
     @Published private var postStartScriptByRepo: [String: String]
+    /// Per-worktree *override* of the resolved repo/global post-start script,
+    /// keyed by worktree path. A missing entry means the worktree inherits its
+    /// repo's value; a present entry (even empty) overrides it. The leaf of the
+    /// Global → Repo → Worktree chain, resolved via `postStartScript(for:)`.
+    @Published private var postStartScriptByWorktree: [String: String]
     /// Base repos the user has added; they appear as (possibly empty) project
     /// groups. Repos are also discovered from existing worktrees' `.git`
     /// pointers, so this list only needs to carry repos with no worktrees yet.
@@ -152,16 +159,22 @@ final class WorktreeStore: ObservableObject {
     /// entry means the repo inherits the global value. Read via
     /// `repoOpenClaudeOverride(forRepo:)`, resolved via `openClaudeOnStart(forRepo:)`.
     @Published private var openClaudeOnStartByRepo: [String: Bool]
+    /// Per-worktree *override* of the resolved repo/global launch-on-start,
+    /// keyed by worktree path. A missing entry means the worktree inherits its
+    /// repo's value. The leaf of the Global → Repo → Worktree chain, resolved
+    /// via `openClaudeOnStart(for:)`.
+    @Published private var openClaudeOnStartByWorktree: [String: Bool]
     /// Global default agent — the root of the Global → Repo → Worktree chain.
     @Published var defaultAgent: Agent {
         didSet { UserDefaults.standard.set(defaultAgent.rawValue, forKey: Self.agentKey) }
     }
     /// Per-repo agent *override*, keyed by repo path; absent = inherit global.
     @Published private var agentByRepo: [String: String]
-    /// The agent a specific worktree was created with, keyed by worktree path,
-    /// so "New session" and resume keep using it rather than the repo/global
-    /// default. Absent for worktrees Spark Plug didn't create (they infer their
-    /// agent from existing sessions instead).
+    /// Per-worktree agent *override*, keyed by worktree path — seeded with the
+    /// agent a worktree is created with, and editable per worktree afterwards, so
+    /// "New session" and resume keep using it rather than the repo/global default.
+    /// Absent means inherit: infer from the worktree's latest session, else fall
+    /// to the repo/global default. The leaf of the Global → Repo → Worktree chain.
     @Published private var agentByWorktree: [String: String]
     @Published private(set) var worktrees: [Worktree] = []
     @Published var errorMessage: String?
@@ -181,6 +194,11 @@ final class WorktreeStore: ObservableObject {
             if let script = value as? String { postStart[path] = script }
         }
         self.postStartScriptByRepo = postStart
+        var postStartWt: [String: String] = [:]
+        for (path, value) in UserDefaults.standard.dictionary(forKey: Self.postStartByWorktreeKey) ?? [:] {
+            if let script = value as? String { postStartWt[path] = script }
+        }
+        self.postStartScriptByWorktree = postStartWt
         self.registeredRepos = UserDefaults.standard.stringArray(forKey: Self.reposKey) ?? []
         self.multiplexer = UserDefaults.standard.string(forKey: Self.multiplexerKey)
             .flatMap(Multiplexer.init(rawValue:)) ?? .tmux
@@ -192,6 +210,11 @@ final class WorktreeStore: ObservableObject {
             if let flag = value as? Bool { openClaude[path] = flag }
         }
         self.openClaudeOnStartByRepo = openClaude
+        var openClaudeWt: [String: Bool] = [:]
+        for (path, value) in UserDefaults.standard.dictionary(forKey: Self.openClaudeByWorktreeKey) ?? [:] {
+            if let flag = value as? Bool { openClaudeWt[path] = flag }
+        }
+        self.openClaudeOnStartByWorktree = openClaudeWt
         self.defaultAgent = UserDefaults.standard.string(forKey: Self.agentKey)
             .flatMap(Agent.init(rawValue:)) ?? .claude
         var agentRepos: [String: String] = [:]
@@ -286,6 +309,35 @@ final class WorktreeStore: ObservableObject {
         openClaudeOnStartByRepo[path] ?? openClaudeOnStartGlobal
     }
 
+    /// Whether a new session in an *existing* `worktree` auto-launches its agent
+    /// — its own override when set, otherwise its inherited value (repo, else
+    /// global). Used by "New session".
+    func openClaudeOnStart(for worktree: Worktree) -> Bool {
+        openClaudeOnStartByWorktree[worktree.url.path] ?? inheritedOpenClaudeOnStart(for: worktree)
+    }
+
+    /// What a worktree's launch-on-start resolves to *without* its own override
+    /// — its repo's value, or the global default for a loose folder. Drives the
+    /// "Inherit (…)" label in the worktree menu.
+    func inheritedOpenClaudeOnStart(for worktree: Worktree) -> Bool {
+        worktree.projectPath.map { openClaudeOnStart(forRepo: $0) } ?? openClaudeOnStartGlobal
+    }
+
+    /// The worktree's explicit launch-on-start override, or nil when it inherits.
+    func worktreeOpenClaudeOverride(forWorktree path: String) -> Bool? {
+        openClaudeOnStartByWorktree[path]
+    }
+
+    /// Sets the worktree override, or clears it (nil) to inherit the repo/global.
+    func setWorktreeOpenClaudeOverride(_ value: Bool?, forWorktree path: String) {
+        if let value {
+            openClaudeOnStartByWorktree[path] = value
+        } else {
+            openClaudeOnStartByWorktree.removeValue(forKey: path)
+        }
+        UserDefaults.standard.set(openClaudeOnStartByWorktree, forKey: Self.openClaudeByWorktreeKey)
+    }
+
     /// The repo's explicit post-start script, or nil when it inherits the global.
     func repoPostStartOverride(forRepo path: String) -> String? {
         postStartScriptByRepo[path]
@@ -308,6 +360,59 @@ final class WorktreeStore: ObservableObject {
         postStartScriptByRepo[path] ?? postStartScriptGlobal
     }
 
+    /// The post-start script a new session in an *existing* `worktree` runs —
+    /// its own override when set, otherwise its inherited value (repo, else
+    /// global). Used by "New session".
+    func postStartScript(for worktree: Worktree) -> String {
+        postStartScriptByWorktree[worktree.url.path] ?? inheritedPostStartScript(for: worktree)
+    }
+
+    /// What a worktree's post-start script resolves to *without* its own
+    /// override — its repo's value, or the global default for a loose folder.
+    /// Drives the placeholder in the worktree's post-start editor.
+    func inheritedPostStartScript(for worktree: Worktree) -> String {
+        worktree.projectPath.map { postStartScript(forRepo: $0) } ?? postStartScriptGlobal
+    }
+
+    /// The worktree's explicit post-start override, or nil when it inherits.
+    func worktreePostStartOverride(forWorktree path: String) -> String? {
+        postStartScriptByWorktree[path]
+    }
+
+    /// Sets the worktree's post-start override, or clears it (nil) to inherit.
+    func setWorktreePostStartOverride(_ value: String?, forWorktree path: String) {
+        if let value {
+            postStartScriptByWorktree[path] = value
+        } else {
+            postStartScriptByWorktree.removeValue(forKey: path)
+        }
+        UserDefaults.standard.set(postStartScriptByWorktree, forKey: Self.postStartByWorktreeKey)
+    }
+
+    /// Turns a just-created worktree's post-start script into a reusable
+    /// template by folding the session name it was created with back into the
+    /// `{brief}` placeholder — so a stored copy re-substitutes each later
+    /// session's own name rather than freezing this first one. Replaces both the
+    /// raw typed name and its sanitised folder form (whichever the user embedded),
+    /// longest first so the more specific match wins. A script that already uses
+    /// `{brief}` is returned unchanged (the literal name won't appear). Empty
+    /// names are skipped so an empty search never rewrites the whole string.
+    func postStartScriptTemplate(
+        _ script: String, sessionName: String?, briefName: String
+    ) -> String {
+        let names = [
+            (sessionName ?? "").trimmingCharacters(in: .whitespacesAndNewlines),
+            briefName,
+        ]
+        .filter { !$0.isEmpty }
+        .sorted { $0.count > $1.count }
+        var template = script
+        for name in names {
+            template = template.replacingOccurrences(of: name, with: "{brief}")
+        }
+        return template
+    }
+
     /// The repo's explicit agent override, or nil when it inherits the global.
     func repoAgentOverride(forRepo path: String) -> Agent? {
         agentByRepo[path].flatMap(Agent.init(rawValue:))
@@ -328,23 +433,33 @@ final class WorktreeStore: ObservableObject {
         repoAgentOverride(forRepo: path) ?? defaultAgent
     }
 
-    /// The agent that was pinned to a specific worktree at creation, if any.
+    /// The worktree's explicit agent override, or nil when it inherits.
     func worktreeAgentOverride(forWorktree path: String) -> Agent? {
         agentByWorktree[path].flatMap(Agent.init(rawValue:))
     }
 
-    /// Pins a worktree to the agent it was created with.
-    func setWorktreeAgent(_ agent: Agent, forWorktree path: String) {
-        agentByWorktree[path] = agent.rawValue
+    /// Sets the worktree's agent override (also how creation pins its agent), or
+    /// clears it (nil) to inherit from the latest session / repo / global.
+    func setWorktreeAgentOverride(_ agent: Agent?, forWorktree path: String) {
+        if let agent {
+            agentByWorktree[path] = agent.rawValue
+        } else {
+            agentByWorktree.removeValue(forKey: path)
+        }
         UserDefaults.standard.set(agentByWorktree, forKey: Self.agentByWorktreeKey)
     }
 
     /// The agent operating in an existing worktree, resolved in priority order:
-    /// the agent it was created with, then the agent of its most recent session
-    /// (so worktrees Spark Plug didn't create still resolve correctly), then the
-    /// repo override, then the global default.
+    /// its explicit override, then the inherited value.
     func agent(for worktree: Worktree) -> Agent {
-        if let pinned = worktreeAgentOverride(forWorktree: worktree.url.path) { return pinned }
+        worktreeAgentOverride(forWorktree: worktree.url.path) ?? inheritedAgent(for: worktree)
+    }
+
+    /// What a worktree's agent resolves to *without* its own override — the
+    /// agent of its most recent session (so worktrees Spark Plug didn't create
+    /// still resolve correctly), then the repo override, then the global
+    /// default. Drives the "Inherit (…)" label in the worktree menu.
+    func inheritedAgent(for worktree: Worktree) -> Agent {
         if let latest = worktree.sessions.first?.agent { return latest }
         return worktree.projectPath.map { agent(forRepo: $0) } ?? defaultAgent
     }
@@ -428,7 +543,22 @@ final class WorktreeStore: ObservableObject {
         let worktreePath = (rootExpanded as NSString).appendingPathComponent(dirName)
         // Pin this worktree to its agent so later "New session" / resume default
         // to it, even when it differs from the repo/global default.
-        setWorktreeAgent(agent, forWorktree: worktreePath)
+        setWorktreeAgentOverride(agent, forWorktree: worktreePath)
+        // Remember the post-start script this worktree was created with, so a
+        // later "New session" runs it — but re-parameterised: the session name
+        // this worktree is created with is folded back into the {brief}
+        // placeholder (matching both the raw typed name and its sanitised folder
+        // form), so future sessions substitute their *own* name instead of
+        // reusing this first one. The first launch still runs the original,
+        // verbatim (see `appendPostStart` below). Stored only when it diverges
+        // from the repo/global default, so an unchanged worktree keeps inheriting
+        // later changes to that default.
+        let template = postStartScriptTemplate(
+            postStartScript, sessionName: sessionName, briefName: briefName)
+        if template.trimmingCharacters(in: .whitespacesAndNewlines)
+            != self.postStartScript(forRepo: repo).trimmingCharacters(in: .whitespacesAndNewlines) {
+            setWorktreePostStartOverride(template, forWorktree: worktreePath)
+        }
         let useScript = willUseSetupScript(repo: repo, ticket: ticket)
         let setupCmd: String
         if useScript {
@@ -453,35 +583,20 @@ final class WorktreeStore: ObservableObject {
         // "final part"), never the ticket or project prefix the folder carries.
         let trimmedSession = (sessionName ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         let sessionLabel = trimmedSession.isEmpty ? briefName : trimmedSession
-        // With the agent off, provision the worktree and drop the user at a
-        // ready shell in it; otherwise launch the agent as the final step.
-        var command = "cd \(singleQuote(scriptDir)) && \(setupCmd) "
+        // Provision the worktree and drop the user into it; the shared tail then
+        // runs the post-start script and (when enabled) launches the agent — with
+        // the agent off, the user is left at a ready shell instead.
+        let provisioned = "cd \(singleQuote(scriptDir)) && \(setupCmd) "
             + "&& cd \(singleQuote(worktreePath)) && clear"
-        // Post-start script runs *inside* the new worktree, after provisioning
-        // and before the agent takes over the terminal. {ticket} {brief} {base}
-        // are substituted verbatim (unquoted) — unlike the setup command's args
-        // — so they can sit inside the user's own quoting, e.g.
-        // `claude -n "{ticket}-{brief}"` to name a session with no setup script.
-        // Empty means run nothing.
-        let postStart = postStartScript
-            .replacingOccurrences(of: "{ticket}", with: ticket)
-            .replacingOccurrences(of: "{brief}", with: briefName)
-            .replacingOccurrences(of: "{base}", with: base)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        if !postStart.isEmpty {
-            // Group the user's script in a subshell so a trailing control
-            // operator stays valid once the agent chain is appended. Bare
-            // concatenation of e.g. `bun dev &` yields `... && bun dev & && claude`,
-            // a syntax error — and since the whole line is parsed before it runs,
-            // that aborts everything, provisioning included. `... && (bun dev &) && claude`
-            // parses cleanly and detaches the background job as intended. A
-            // subshell needs no trailing terminator, so `(foo)`, `(foo &)` and
-            // `(foo;)` are all valid.
-            command += " && (\(postStart))"
-        }
-        if openClaude {
-            command += " && \(agent.newSessionCommand(name: sessionLabel))"
-        }
+        let command = appendPostStart(
+            to: provisioned,
+            script: postStartScript,
+            ticket: ticket,
+            brief: briefName,
+            base: base,
+            openClaude: openClaude,
+            agent: agent,
+            sessionLabel: sessionLabel)
         // Bring the base branch up to date with its remote *before* cutting the
         // worktree, off the main actor so the network I/O never freezes the UI.
         // A clean refresh is silent; a stash reapply that conflicts surfaces via
@@ -748,14 +863,67 @@ final class WorktreeStore: ObservableObject {
         launch(command, windowName: windowName(worktree: worktree.name, session: session.title))
     }
 
-    /// Starts a fresh session of `agent` in a worktree. The typed name labels
-    /// the session where the agent supports naming (Claude today) and always
-    /// labels the multiplexer window/workspace.
+    /// Starts a fresh session of `agent` in an existing worktree, honouring the
+    /// same launch-on-start and post-start-script settings as worktree creation
+    /// (resolved from the worktree's repo, or the global default for a loose
+    /// folder): the post-start script runs first, then the agent launches only
+    /// when launch-on-start is on — otherwise the user is left at a ready shell.
+    /// The typed name labels the session where the agent supports naming (Claude
+    /// today) and the multiplexer window/workspace (falling back to the worktree
+    /// name only when no session name was given). In the script {brief} is that
+    /// name and {base} the worktree's checked-out branch; {ticket} has no
+    /// analogue here and collapses to empty.
     func startSession(in worktree: Worktree, agent: Agent, name: String?) {
         let trimmed = name?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let command = "cd \(singleQuote(worktree.url.path)) && clear && "
-            + agent.newSessionCommand(name: trimmed)
-        launch(command, windowName: windowName(worktree: worktree.name, session: trimmed))
+        let command = appendPostStart(
+            to: "cd \(singleQuote(worktree.url.path)) && clear",
+            script: postStartScript(for: worktree),
+            ticket: "",
+            brief: trimmed ?? "",
+            base: currentBranch(in: worktree.url.path) ?? "",
+            openClaude: openClaudeOnStart(for: worktree),
+            agent: agent,
+            sessionLabel: trimmed)
+        let label = trimmed.flatMap { $0.isEmpty ? nil : $0 } ?? worktree.name
+        launch(command, windowName: label)
+    }
+
+    /// Appends the post-start script and, when `openClaude`, the agent launch to
+    /// a command that has already `cd`'d into the worktree — the tail shared by
+    /// worktree creation and "New session". {ticket} {brief} {base} in the script
+    /// are substituted verbatim (unquoted, unlike the setup command's args) so
+    /// they can sit inside the user's own quoting, e.g. `claude -n "{ticket}-{brief}"`;
+    /// a placeholder with no analogue in the caller's context is passed as empty.
+    /// The script is grouped in a subshell so a trailing control operator stays
+    /// valid once the agent chain is appended: bare concatenation of e.g. `bun dev &`
+    /// yields `... && bun dev & && claude`, a syntax error that — since the whole
+    /// line is parsed before it runs — aborts everything, provisioning included.
+    /// `... && (bun dev &) && claude` parses cleanly and detaches the background
+    /// job as intended. A subshell needs no trailing terminator, so `(foo)`,
+    /// `(foo &)` and `(foo;)` are all valid. Empty script means run nothing.
+    private func appendPostStart(
+        to command: String,
+        script: String,
+        ticket: String,
+        brief: String,
+        base: String,
+        openClaude: Bool,
+        agent: Agent,
+        sessionLabel: String?
+    ) -> String {
+        var command = command
+        let postStart = script
+            .replacingOccurrences(of: "{ticket}", with: ticket)
+            .replacingOccurrences(of: "{brief}", with: brief)
+            .replacingOccurrences(of: "{base}", with: base)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !postStart.isEmpty {
+            command += " && (\(postStart))"
+        }
+        if openClaude {
+            command += " && \(agent.newSessionCommand(name: sessionLabel))"
+        }
+        return command
     }
 
     /// "worktree — session" so several sessions in the same worktree stay

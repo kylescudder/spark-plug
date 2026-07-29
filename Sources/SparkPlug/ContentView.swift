@@ -28,6 +28,7 @@ struct ContentView: View {
     @State private var pendingNewSession: Worktree?
     @State private var pendingNewWorktree: ProjectGroup?
     @State private var pendingRepoSettings: ProjectGroup?
+    @State private var pendingWorktreeSettings: Worktree?
     @State private var sessionToDelete: AgentSession?
     @State private var worktreeToDelete: Worktree?
     @Environment(\.openWindow) private var openWindow
@@ -76,6 +77,9 @@ struct ContentView: View {
                         worktree: wt,
                         agent: store.agent(for: wt),
                         windowNoun: store.multiplexer.windowNoun,
+                        launchesAgent: store.openClaudeOnStart(for: wt),
+                        postStartScript: store.postStartScript(for: wt),
+                        base: store.currentBranch(in: wt.url.path) ?? "",
                         onCancel: { pendingNewSession = nil }
                     ) { name in
                         store.startSession(in: wt, agent: store.agent(for: wt), name: name)
@@ -97,6 +101,12 @@ struct ContentView: View {
                         group: group,
                         store: store,
                         onDismiss: { pendingRepoSettings = nil }
+                    )
+                } else if let wt = pendingWorktreeSettings {
+                    WorktreeSettingsCard(
+                        worktree: wt,
+                        store: store,
+                        onDismiss: { pendingWorktreeSettings = nil }
                     )
                 } else if let session = sessionToDelete {
                     let title = session.title
@@ -129,7 +139,7 @@ struct ContentView: View {
 
     private var isModalActive: Bool {
         pendingNewSession != nil || pendingNewWorktree != nil
-            || pendingRepoSettings != nil
+            || pendingRepoSettings != nil || pendingWorktreeSettings != nil
             || sessionToDelete != nil || worktreeToDelete != nil
             || store.pendingSessionLaunch != nil
     }
@@ -386,6 +396,33 @@ struct ContentView: View {
             .help("Start a new Claude session")
 
             Menu {
+                // Same Global → Repo → Worktree overrides the project header
+                // offers, but for this one worktree: they seed new sessions
+                // here just as the repo's do for new worktrees.
+                Menu("Agent") {
+                    Picker("Agent", selection: Binding<Agent?>(
+                        get: { store.worktreeAgentOverride(forWorktree: wt.url.path) },
+                        set: { store.setWorktreeAgentOverride($0, forWorktree: wt.url.path) })) {
+                        Text("Inherit (\(store.inheritedAgent(for: wt).displayName))").tag(Agent?.none)
+                        ForEach(Agent.allCases) { a in
+                            Text(a.displayName).tag(Agent?.some(a))
+                        }
+                    }
+                }
+                Picker("Launch agent on start", selection: Binding<Bool?>(
+                    get: { store.worktreeOpenClaudeOverride(forWorktree: wt.url.path) },
+                    set: { store.setWorktreeOpenClaudeOverride($0, forWorktree: wt.url.path) })) {
+                    Text("Inherit (\(store.inheritedOpenClaudeOnStart(for: wt) ? "On" : "Off"))")
+                        .tag(Bool?.none)
+                    Text("On").tag(Bool?.some(true))
+                    Text("Off").tag(Bool?.some(false))
+                }
+                Button {
+                    pendingWorktreeSettings = wt
+                } label: {
+                    Label("Post-start script…", systemImage: "terminal")
+                }
+                Divider()
                 Button(role: .destructive) {
                     worktreeToDelete = wt
                 } label: {
@@ -397,7 +434,7 @@ struct ContentView: View {
             .menuStyle(.borderlessButton)
             .menuIndicator(.hidden)
             .fixedSize()
-            .help("More actions")
+            .help("Worktree settings and actions")
         }
         .padding(.vertical, 4)
     }
@@ -588,6 +625,17 @@ private struct NewSessionCard: View {
     let agent: Agent
     /// What the selected multiplexer calls its container ("window"/"workspace").
     let windowNoun: String
+    /// Whether launch-on-start (resolved from the worktree's repo/global) will
+    /// actually start the agent — off leaves a shell after any post-start script.
+    let launchesAgent: Bool
+    /// The resolved post-start script this session will run (worktree override,
+    /// else repo, else global) — shown so the user sees what fires before the
+    /// agent. Empty means nothing runs. Its placeholders are resolved live in
+    /// the preview once a session name is typed (see `resolvedPostStart`).
+    let postStartScript: String
+    /// The worktree's checked-out branch, substituted for `{base}` in the
+    /// post-start preview to match what `startSession` will actually run.
+    let base: String
     let onCancel: () -> Void
     let onStart: (String) -> Void
 
@@ -611,6 +659,31 @@ private struct NewSessionCard: View {
                 .textFieldStyle(.roundedBorder)
                 .focused($focused)
                 .onSubmit(commit)
+
+            // The post-start script the worktree carries (from creation or the
+            // ⋯ menu), so the user sees what runs before the agent. Shows the
+            // worktree's stored value until a session name is typed, then
+            // resolves its placeholders exactly as the launch will. Edit the
+            // stored value via the worktree's ⋯ → Post-start script… menu.
+            if !postStartScript.isEmpty {
+                HStack(alignment: .top, spacing: 6) {
+                    Image(systemName: "terminal")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Runs first")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                        Text(resolvedPostStart)
+                            .font(.caption.monospaced())
+                            .textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer(minLength: 0)
+                }
+                .padding(8)
+                .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
+            }
 
             Text(preview)
                 .font(.caption2)
@@ -637,11 +710,27 @@ private struct NewSessionCard: View {
         name.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    /// The post-start script as it will actually run: the worktree's stored
+    /// value shown verbatim until a session name is typed, then with the same
+    /// substitutions `startSession` applies — {brief} = the typed name, {base} =
+    /// the worktree branch, {ticket} = empty (no analogue for an existing
+    /// worktree). So the preview tracks the name field instead of a stale value.
+    private var resolvedPostStart: String {
+        guard !trimmed.isEmpty else { return postStartScript }
+        return postStartScript
+            .replacingOccurrences(of: "{ticket}", with: "")
+            .replacingOccurrences(of: "{brief}", with: trimmed)
+            .replacingOccurrences(of: "{base}", with: base)
+    }
+
     private var preview: String {
         guard !trimmed.isEmpty else {
-            return "Starts a Claude session in this worktree."
+            return launchesAgent
+                ? "Starts a \(agent.displayName) session in this worktree."
+                : "Opens a shell in this worktree — \(agent.displayName) won't launch on start."
         }
-        return "\(windowNoun.capitalized): “\(worktree.name) — \(trimmed)”"
+        let container = "\(windowNoun.capitalized): “\(trimmed)”"
+        return launchesAgent ? container : "\(container) · shell only, no \(agent.displayName)"
     }
 
     private func commit() {
@@ -713,6 +802,72 @@ private struct RepoSettingsCard: View {
         store.setRepoPostStartOverride(
             inherit ? nil : script.trimmingCharacters(in: .whitespacesAndNewlines),
             forRepo: path)
+        onDismiss()
+    }
+}
+
+/// The per-worktree twin of `RepoSettingsCard`: a free-text post-start override
+/// that can't live in a Menu. "Inherit" clears the override so the worktree
+/// uses its repo's resolved value; unchecking it stores the field's text (even
+/// empty) as this worktree's own value.
+private struct WorktreeSettingsCard: View {
+    let worktree: Worktree
+    @ObservedObject var store: WorktreeStore
+    let onDismiss: () -> Void
+
+    @State private var inherit: Bool = true
+    @State private var script: String = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 8) {
+                Image(systemName: "terminal")
+                    .foregroundStyle(.yellow)
+                Text("\(worktree.name) post-start script").font(.headline)
+            }
+
+            Toggle("Inherit from repo", isOn: $inherit)
+                .toggleStyle(.checkbox)
+
+            VStack(alignment: .leading, spacing: 6) {
+                TextField(inheritedPlaceholder, text: $script)
+                    .textFieldStyle(.roundedBorder)
+                    .disabled(inherit)
+                Text("Runs in this worktree when you start a new session, before the agent. {brief} (the session name) and {base} (the current branch) are substituted.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            HStack {
+                Spacer()
+                Button("Cancel") { onDismiss() }
+                    .keyboardShortcut(.cancelAction)
+                Button("Save") { commit() }
+                    .keyboardShortcut(.defaultAction)
+                    .buttonStyle(.borderedProminent)
+            }
+        }
+        .padding(20)
+        .frame(width: 440)
+        .onAppear {
+            let override = store.worktreePostStartOverride(forWorktree: worktree.url.path)
+            inherit = override == nil
+            script = override ?? store.inheritedPostStartScript(for: worktree)
+        }
+    }
+
+    /// The inherited repo/global value, shown as the field's placeholder so an
+    /// inheriting worktree still previews what it will run.
+    private var inheritedPlaceholder: String {
+        let inherited = store.inheritedPostStartScript(for: worktree)
+        return inherited.isEmpty ? "bun dev" : inherited
+    }
+
+    private func commit() {
+        store.setWorktreePostStartOverride(
+            inherit ? nil : script.trimmingCharacters(in: .whitespacesAndNewlines),
+            forWorktree: worktree.url.path)
         onDismiss()
     }
 }
