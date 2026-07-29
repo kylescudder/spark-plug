@@ -27,6 +27,7 @@ struct ContentView: View {
         Set(UserDefaults.standard.stringArray(forKey: collapsedKey) ?? [])
     @State private var pendingNewSession: Worktree?
     @State private var pendingNewWorktree: ProjectGroup?
+    @State private var pendingRepoSettings: ProjectGroup?
     @State private var sessionToDelete: AgentSession?
     @State private var worktreeToDelete: Worktree?
     @Environment(\.openWindow) private var openWindow
@@ -91,6 +92,12 @@ struct ContentView: View {
                             pendingNewWorktree = nil
                         }
                     )
+                } else if let group = pendingRepoSettings {
+                    RepoSettingsCard(
+                        group: group,
+                        store: store,
+                        onDismiss: { pendingRepoSettings = nil }
+                    )
                 } else if let session = sessionToDelete {
                     let title = session.title
                         ?? session.firstMessage.map { $0.count > 40 ? String($0.prefix(40)) + "…" : $0 }
@@ -122,6 +129,7 @@ struct ContentView: View {
 
     private var isModalActive: Bool {
         pendingNewSession != nil || pendingNewWorktree != nil
+            || pendingRepoSettings != nil
             || sessionToDelete != nil || worktreeToDelete != nil
             || store.pendingSessionLaunch != nil
     }
@@ -310,6 +318,11 @@ struct ContentView: View {
                             .tag(Bool?.none)
                         Text("On").tag(Bool?.some(true))
                         Text("Off").tag(Bool?.some(false))
+                    }
+                    Button {
+                        pendingRepoSettings = group
+                    } label: {
+                        Label("Post-start script…", systemImage: "terminal")
                     }
                     // Forgetting a repo only makes sense once it has no worktrees
                     // left to keep rediscovering it.
@@ -637,6 +650,73 @@ private struct NewSessionCard: View {
     }
 }
 
+/// Per-repo overrides that can't live in a Menu (a free-text script). Today
+/// that's the post-start script: an "Inherit from global" toggle plus a field
+/// for the repo's own value. Inherit clears the override; unchecking it stores
+/// the field's text (even empty) as the repo's explicit value.
+private struct RepoSettingsCard: View {
+    let group: ProjectGroup
+    @ObservedObject var store: WorktreeStore
+    let onDismiss: () -> Void
+
+    @State private var inherit: Bool = true
+    @State private var script: String = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 8) {
+                Image(systemName: "terminal")
+                    .foregroundStyle(.yellow)
+                Text("\(group.name) post-start script").font(.headline)
+            }
+
+            Toggle("Inherit from global", isOn: $inherit)
+                .toggleStyle(.checkbox)
+
+            VStack(alignment: .leading, spacing: 6) {
+                TextField(globalPlaceholder, text: $script)
+                    .textFieldStyle(.roundedBorder)
+                    .disabled(inherit)
+                Text("Runs inside new \(group.name) worktrees after setup and before the agent. Individual worktrees can still override it. {ticket}, {brief} and {base} are substituted.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            HStack {
+                Spacer()
+                Button("Cancel") { onDismiss() }
+                    .keyboardShortcut(.cancelAction)
+                Button("Save") { commit() }
+                    .keyboardShortcut(.defaultAction)
+                    .buttonStyle(.borderedProminent)
+            }
+        }
+        .padding(20)
+        .frame(width: 440)
+        .onAppear {
+            guard let path = group.path else { return }
+            let override = store.repoPostStartOverride(forRepo: path)
+            inherit = override == nil
+            script = override ?? store.postStartScriptGlobal
+        }
+    }
+
+    /// The global value, shown as the field's placeholder so an inheriting repo
+    /// still previews what it will run.
+    private var globalPlaceholder: String {
+        store.postStartScriptGlobal.isEmpty ? "bun dev" : store.postStartScriptGlobal
+    }
+
+    private func commit() {
+        guard let path = group.path else { onDismiss(); return }
+        store.setRepoPostStartOverride(
+            inherit ? nil : script.trimmingCharacters(in: .whitespacesAndNewlines),
+            forRepo: path)
+        onDismiss()
+    }
+}
+
 /// Per-project worktree creation: a name plus optional ticket — the repo
 /// comes from the group, the fork point defaults to the branch checked out in
 /// the base repo (with a dropdown to branch off any local or remote branch
@@ -661,6 +741,9 @@ private struct NewWorktreeCard: View {
     /// resolved defaults in `onAppear`, then overridable here for this one.
     @State private var agent: Agent = .claude
     @State private var openClaude: Bool = true
+    /// Post-start script for this worktree, seeded from the repo's resolved
+    /// default in `onAppear`, then overridable here for this one.
+    @State private var postStartScript: String = ""
     @FocusState private var focused: Bool
 
     var body: some View {
@@ -723,6 +806,16 @@ private struct NewWorktreeCard: View {
                 .toggleStyle(.checkbox)
                 .font(.caption)
 
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Post-start script").font(.caption).foregroundStyle(.secondary)
+                TextField("bun dev", text: $postStartScript)
+                    .textFieldStyle(.roundedBorder)
+                Text("Runs in the worktree before the agent. {ticket}, {brief} and {base} are substituted — e.g. claude -n \"{ticket}-{brief}\".")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
             Text(preview)
                 .font(.caption2)
                 .foregroundStyle(.secondary)
@@ -752,6 +845,7 @@ private struct NewWorktreeCard: View {
             buildBranches()
             openClaude = group.path.map { store.openClaudeOnStart(forRepo: $0) } ?? true
             agent = group.path.map { store.agent(forRepo: $0) } ?? store.defaultAgent
+            postStartScript = group.path.map { store.postStartScript(forRepo: $0) } ?? ""
         }
         .onChange(of: name) { problem = nil }
         .onChange(of: ticket) { problem = nil }
@@ -792,7 +886,7 @@ private struct NewWorktreeCard: View {
         guard let path = group.path, !trimmed.isEmpty else { return }
         if let p = store.createWorktree(repoPath: path, ticket: ticket, name: trimmed,
                                         baseBranch: selectedBranch, openClaude: openClaude,
-                                        agent: agent) {
+                                        postStartScript: postStartScript, agent: agent) {
             problem = p
             return
         }
