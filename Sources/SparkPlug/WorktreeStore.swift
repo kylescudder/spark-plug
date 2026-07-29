@@ -469,7 +469,15 @@ final class WorktreeStore: ObservableObject {
             .replacingOccurrences(of: "{base}", with: base)
             .trimmingCharacters(in: .whitespacesAndNewlines)
         if !postStart.isEmpty {
-            command += " && \(postStart)"
+            // Group the user's script in a subshell so a trailing control
+            // operator stays valid once the agent chain is appended. Bare
+            // concatenation of e.g. `bun dev &` yields `... && bun dev & && claude`,
+            // a syntax error — and since the whole line is parsed before it runs,
+            // that aborts everything, provisioning included. `... && (bun dev &) && claude`
+            // parses cleanly and detaches the background job as intended. A
+            // subshell needs no trailing terminator, so `(foo)`, `(foo &)` and
+            // `(foo;)` are all valid.
+            command += " && (\(postStart))"
         }
         if openClaude {
             command += " && \(agent.newSessionCommand(name: sessionLabel))"
