@@ -220,7 +220,11 @@ struct ContentView: View {
 
     @ViewBuilder
     private var searchField: some View {
-        if !store.worktrees.isEmpty {
+        // Stay visible while a query is active even if the list just emptied —
+        // otherwise deleting the last matching worktree removes the only way to
+        // clear the search, stranding the user on the no-results view with the
+        // registered repos hidden.
+        if !store.worktrees.isEmpty || isSearching {
             HStack(spacing: 6) {
                 Image(systemName: "magnifyingglass")
                     .font(.caption)
