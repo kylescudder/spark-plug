@@ -20,6 +20,30 @@ private func relativeShort(_ date: Date) -> String {
     }
 }
 
+/// Case-insensitive subsequence fuzzy match: matches when every character of
+/// `query` appears in `text` in order (so "e2e381" finds
+/// "MP5-14381_E2E_User_Perms"). Returns a score — higher is a closer match —
+/// or nil when it doesn't match. Contiguous runs and hits at word boundaries
+/// (start, or after `_ - / space`) score higher so the tightest worktree
+/// floats to the top of its group.
+private func fuzzyScore(_ query: String, _ text: String) -> Int? {
+    let q = Array(query.lowercased())
+    guard !q.isEmpty else { return 0 }
+    let t = Array(text.lowercased())
+    var qi = 0
+    var score = 0
+    var streak = 0
+    var prevMatch = -2
+    for (ti, ch) in t.enumerated() where qi < q.count && ch == q[qi] {
+        streak = (ti == prevMatch + 1) ? streak + 1 : 0
+        score += 1 + streak
+        if ti == 0 || "_-/ ".contains(t[ti - 1]) { score += 3 }
+        prevMatch = ti
+        qi += 1
+    }
+    return qi == q.count ? score : nil
+}
+
 struct ContentView: View {
     @ObservedObject private var store = WorktreeStore.shared
     private static let collapsedKey = "SparkPlug.collapsedProjects"
@@ -30,6 +54,8 @@ struct ContentView: View {
     @State private var pendingRepoSettings: ProjectGroup?
     @State private var sessionToDelete: AgentSession?
     @State private var worktreeToDelete: Worktree?
+    @State private var searchText = ""
+    @FocusState private var searchFocused: Bool
     @Environment(\.openWindow) private var openWindow
     /// Tracks the focus state of the hosting window. The menu-bar popover is an
     /// NSPanel that becomes `.key` when opened and `.inactive` when dismissed —
@@ -44,6 +70,7 @@ struct ContentView: View {
             VStack(spacing: 0) {
                 header
                 Divider()
+                searchField
                 if let msg = store.errorMessage {
                     Text(msg)
                         .font(.callout)
@@ -56,6 +83,11 @@ struct ContentView: View {
                 Divider()
                 footer
             }
+            .background(
+                Button("") { searchFocused = true }
+                    .keyboardShortcut("f", modifiers: .command)
+                    .hidden()
+            )
             modalOverlay
         }
         .onChange(of: controlActiveState) { _, state in
@@ -152,6 +184,57 @@ struct ContentView: View {
         .padding(.vertical, 6)
     }
 
+    /// True when the search box holds a non-whitespace query.
+    private var isSearching: Bool {
+        !searchText.trimmingCharacters(in: .whitespaces).isEmpty
+    }
+
+    /// Project groups shown in the list: every group unchanged when not
+    /// searching; otherwise only groups with a fuzzy-matching worktree, each
+    /// narrowed to its matches and ranked best-first.
+    private var displayedGroups: [ProjectGroup] {
+        guard isSearching else { return store.projectGroups }
+        let q = searchText.trimmingCharacters(in: .whitespaces)
+        return store.projectGroups.compactMap { group in
+            let ranked = group.worktrees
+                .compactMap { wt in fuzzyScore(q, wt.name).map { (wt, $0) } }
+                .sorted { $0.1 > $1.1 }
+                .map(\.0)
+            guard !ranked.isEmpty else { return nil }
+            return ProjectGroup(name: group.name, path: group.path,
+                                isRegistered: group.isRegistered, worktrees: ranked)
+        }
+    }
+
+    @ViewBuilder
+    private var searchField: some View {
+        if !store.worktrees.isEmpty {
+            HStack(spacing: 6) {
+                Image(systemName: "magnifyingglass")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                TextField("Search worktrees", text: $searchText)
+                    .textFieldStyle(.plain)
+                    .focused($searchFocused)
+                if !searchText.isEmpty {
+                    Button {
+                        searchText = ""
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Clear search")
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(Color.secondary.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+        }
+    }
+
     private var header: some View {
         HStack(spacing: 8) {
             Image(systemName: "bolt.fill")
@@ -205,14 +288,18 @@ struct ContentView: View {
                     systemImage: "tray",
                     description: Text("Add a base repo to start creating worktrees.")
                 )
+            } else if isSearching && displayedGroups.isEmpty {
+                ContentUnavailableView.search(text: searchText)
             } else {
                 // A plain VStack instead of List: NSTableView-backed Lists
                 // snap rather than animate conditional section content.
                 ScrollView {
                     VStack(spacing: 0) {
-                        ForEach(store.projectGroups) { group in
+                        ForEach(displayedGroups) { group in
                             projectHeader(group)
-                            if !collapsedProjects.contains(group.id) {
+                            // While searching, matched groups stay open
+                            // regardless of their saved collapsed state.
+                            if isSearching || !collapsedProjects.contains(group.id) {
                                 groupRows(group)
                             }
                         }
