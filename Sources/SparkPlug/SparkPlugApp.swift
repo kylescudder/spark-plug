@@ -16,7 +16,7 @@ struct SparkPlugApp: App {
     var body: some Scene {
         MenuBarExtra {
             ContentView()
-                .frame(width: 640, height: 540)
+                .frame(width: 640)
         } label: {
             Image(systemName: "bolt.fill")
         }

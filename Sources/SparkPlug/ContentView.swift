@@ -44,8 +44,19 @@ private func fuzzyScore(_ query: String, _ text: String) -> Int? {
     return qi == q.count ? score : nil
 }
 
+/// Reports the intrinsic height of the scrollable list so the popover can hug
+/// its content (short result sets) instead of always filling a fixed height.
+private struct ListHeightKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
 struct ContentView: View {
     @ObservedObject private var store = WorktreeStore.shared
+    /// Cap on the scrollable list; beyond this it scrolls rather than grows.
+    private static let maxListHeight: CGFloat = 440
     private static let collapsedKey = "SparkPlug.collapsedProjects"
     @State private var collapsedProjects: Set<String> =
         Set(UserDefaults.standard.stringArray(forKey: collapsedKey) ?? [])
@@ -55,6 +66,7 @@ struct ContentView: View {
     @State private var sessionToDelete: AgentSession?
     @State private var worktreeToDelete: Worktree?
     @State private var searchText = ""
+    @State private var listHeight: CGFloat = 0
     @FocusState private var searchFocused: Bool
     @Environment(\.openWindow) private var openWindow
     /// Tracks the focus state of the hosting window. The menu-bar popover is an
@@ -289,7 +301,20 @@ struct ContentView: View {
                     description: Text("Add a base repo to start creating worktrees.")
                 )
             } else if isSearching && displayedGroups.isEmpty {
-                ContentUnavailableView.search(text: searchText)
+                // A compact inline state — ContentUnavailableView.search is a
+                // full-window control and dwarfs this popover.
+                VStack(spacing: 6) {
+                    Image(systemName: "magnifyingglass")
+                        .font(.title3)
+                        .foregroundStyle(.secondary)
+                    Text("No worktrees match “\(searchText)”")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 28)
             } else {
                 // A plain VStack instead of List: NSTableView-backed Lists
                 // snap rather than animate conditional section content.
@@ -306,7 +331,15 @@ struct ContentView: View {
                     }
                     .animation(.easeInOut(duration: 0.2), value: collapsedProjects)
                     .padding(.vertical, 4)
+                    .background(GeometryReader { geo in
+                        Color.clear.preference(key: ListHeightKey.self, value: geo.size.height)
+                    })
                 }
+                // Hug the content up to the cap so few/zero results don't leave
+                // a tall empty void; fall back to the cap before first measure.
+                .frame(height: min(listHeight == 0 ? Self.maxListHeight : listHeight,
+                                   Self.maxListHeight))
+                .onPreferenceChange(ListHeightKey.self) { listHeight = $0 }
             }
         }
     }
