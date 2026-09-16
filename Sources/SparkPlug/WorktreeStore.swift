@@ -766,7 +766,12 @@ final class WorktreeStore: ObservableObject {
         if name.contains(where: \.isWhitespace) {
             return "Spaces aren't valid in a branch name. Try “\(suggestion)”."
         }
-        if runGit(["check-ref-format", "--branch", name]).status != 0 {
+        // git exits 128 for a genuinely malformed name. Any other non-zero exit
+        // (e.g. 69 when the Xcode CLT git shim refuses until its licence is
+        // accepted, or 127 when git is missing) means git couldn't judge the
+        // name at all — don't mislabel that as an invalid branch, or we'd reject
+        // a perfectly good name and "suggest" the identical string back.
+        if runGit(["check-ref-format", "--branch", name]).status == 128 {
             return "“\(name)” isn't a valid git branch name. Try “\(suggestion)”."
         }
         return nil
