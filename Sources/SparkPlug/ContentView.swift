@@ -144,6 +144,12 @@ struct ContentView: View {
                     RepoSettingsCard(
                         group: group,
                         store: store,
+                        onRelocated: { old, new in
+                            // Keep the group's collapsed state across the move.
+                            guard collapsedProjects.remove(old) != nil else { return }
+                            collapsedProjects.insert(new)
+                            UserDefaults.standard.set(Array(collapsedProjects), forKey: Self.collapsedKey)
+                        },
                         onDismiss: { pendingRepoSettings = nil }
                     )
                 } else if let wt = pendingWorktreeSettings {
@@ -224,7 +230,8 @@ struct ContentView: View {
                 .map(\.0)
             guard !ranked.isEmpty else { return nil }
             return ProjectGroup(name: group.name, path: group.path,
-                                isRegistered: group.isRegistered, worktrees: ranked)
+                                isRegistered: group.isRegistered,
+                                isMissing: group.isMissing, worktrees: ranked)
         }
     }
 
@@ -424,6 +431,17 @@ struct ContentView: View {
             .help(group.path ?? group.name)
 
             if let path = group.path {
+                if group.isMissing {
+                    Button {
+                        pendingRepoSettings = group
+                    } label: {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Not found at \(path) — click to update its location")
+                }
+
                 Button {
                     pendingNewWorktree = group
                 } label: {
@@ -432,7 +450,10 @@ struct ContentView: View {
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
-                .help("Create a new \(group.name) worktree")
+                .disabled(group.isMissing)
+                .help(group.isMissing
+                      ? "\(group.name) wasn't found — update its location first"
+                      : "Create a new \(group.name) worktree")
 
                 Menu {
                     Menu("Agent") {
@@ -456,7 +477,7 @@ struct ContentView: View {
                     Button {
                         pendingRepoSettings = group
                     } label: {
-                        Label("Post-start script…", systemImage: "terminal")
+                        Label("Repo settings…", systemImage: "gearshape")
                     }
                     // Forgetting a repo only makes sense once it has no worktrees
                     // left to keep rediscovering it.
@@ -863,36 +884,74 @@ private struct NewSessionCard: View {
     }
 }
 
-/// Per-repo overrides that can't live in a Menu (a free-text script). Today
-/// that's the post-start script: an "Inherit from global" toggle plus a field
-/// for the repo's own value. Inherit clears the override; unchecking it stores
-/// the field's text (even empty) as the repo's explicit value.
+/// Per-repo settings that can't live in a Menu (free text). The repo's
+/// location — editable so a repo moved on disk can be re-pointed, carrying its
+/// settings and worktree links along — and its post-start script: an "Inherit
+/// from global" toggle plus a field for the repo's own value. Inherit clears
+/// the override; unchecking it stores the field's text (even empty) as the
+/// repo's explicit value.
 private struct RepoSettingsCard: View {
     let group: ProjectGroup
     @ObservedObject var store: WorktreeStore
+    /// Called with (old, new) paths after a successful relocation.
+    let onRelocated: (String, String) -> Void
     let onDismiss: () -> Void
 
+    @State private var location: String = ""
     @State private var inherit: Bool = true
     @State private var script: String = ""
+    @State private var problem: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(spacing: 8) {
-                Image(systemName: "terminal")
+                Image(systemName: "gearshape.fill")
                     .foregroundStyle(.yellow)
-                Text("\(group.name) post-start script").font(.headline)
+                Text("\(group.name) settings").font(.headline)
             }
 
-            Toggle("Inherit from global", isOn: $inherit)
-                .toggleStyle(.checkbox)
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Location").font(.caption).foregroundStyle(.secondary)
+                HStack(spacing: 8) {
+                    TextField(group.path ?? "", text: $location)
+                        .textFieldStyle(.roundedBorder)
+                    Button("Browse…") {
+                        if let path = WorktreeStore.promptForFolder(
+                            message: "Pick where \(group.name) lives now") {
+                            location = path
+                        }
+                    }
+                }
+                if group.isMissing {
+                    Label("No git repository found here — point this at where \(group.name) lives now.",
+                          systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Text("The base repo new worktrees are created from. Changing it carries this repo's settings over and repairs its worktrees' links to it.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
 
             VStack(alignment: .leading, spacing: 6) {
+                Text("Post-start script").font(.caption).foregroundStyle(.secondary)
+                Toggle("Inherit from global", isOn: $inherit)
+                    .toggleStyle(.checkbox)
                 TextField(globalPlaceholder, text: $script)
                     .textFieldStyle(.roundedBorder)
                     .disabled(inherit)
                 Text("Runs inside new \(group.name) worktrees after setup and before the agent. Individual worktrees can still override it. {ticket}, {brief} and {base} are substituted.")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if let problem {
+                Text(problem)
+                    .font(.caption)
+                    .foregroundStyle(.red)
                     .fixedSize(horizontal: false, vertical: true)
             }
 
@@ -903,12 +962,14 @@ private struct RepoSettingsCard: View {
                 Button("Save") { commit() }
                     .keyboardShortcut(.defaultAction)
                     .buttonStyle(.borderedProminent)
+                    .disabled(location.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
         }
         .padding(20)
         .frame(width: 440)
         .onAppear {
             guard let path = group.path else { return }
+            location = path
             let override = store.repoPostStartOverride(forRepo: path)
             inherit = override == nil
             script = override ?? store.postStartScriptGlobal
@@ -921,8 +982,18 @@ private struct RepoSettingsCard: View {
         store.postStartScriptGlobal.isEmpty ? "bun dev" : store.postStartScriptGlobal
     }
 
+    /// Relocates first, so the post-start value lands on the repo's final path
+    /// (and a bad location leaves everything untouched, with the card open).
     private func commit() {
-        guard let path = group.path else { onDismiss(); return }
+        guard let oldPath = group.path else { onDismiss(); return }
+        let path = WorktreeStore.standardizedRepoPath(location)
+        if path != oldPath {
+            if let problem = store.relocateRepo(from: oldPath, to: path) {
+                self.problem = problem
+                return
+            }
+            onRelocated(oldPath, path)
+        }
         store.setRepoPostStartOverride(
             inherit ? nil : script.trimmingCharacters(in: .whitespacesAndNewlines),
             forRepo: path)

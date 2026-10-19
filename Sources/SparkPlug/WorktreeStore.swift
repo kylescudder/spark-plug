@@ -31,6 +31,9 @@ struct ProjectGroup: Identifiable {
     /// Main repo path; nil only for the trailing "Other" group.
     let path: String?
     let isRegistered: Bool
+    /// The repo folder is gone from `path` — typically moved on disk, leaving
+    /// the registration (or its worktrees' `.git` pointers) behind.
+    let isMissing: Bool
     let worktrees: [Worktree]
     var id: String { path ?? name }
 }
@@ -144,8 +147,14 @@ final class WorktreeStore: ObservableObject {
     /// groups. Repos are also discovered from existing worktrees' `.git`
     /// pointers, so this list only needs to carry repos with no worktrees yet.
     @Published var registeredRepos: [String] {
-        didSet { UserDefaults.standard.set(registeredRepos, forKey: Self.reposKey) }
+        didSet {
+            UserDefaults.standard.set(registeredRepos, forKey: Self.reposKey)
+            refreshMissingRepos()
+        }
     }
+    /// Group paths with no git repo on disk. Refreshed by `scan()` and on
+    /// registration changes so view bodies never stat the disk.
+    @Published private(set) var missingRepoPaths: Set<String> = []
     /// Which terminal multiplexer new Claude sessions open into.
     @Published var multiplexer: Multiplexer {
         didSet { UserDefaults.standard.set(multiplexer.rawValue, forKey: Self.multiplexerKey) }
@@ -248,6 +257,7 @@ final class WorktreeStore: ObservableObject {
                 name: URL(fileURLWithPath: path).lastPathComponent,
                 path: path,
                 isRegistered: registered.contains(path),
+                isMissing: missingRepoPaths.contains(path),
                 worktrees: byPath[path] ?? []
             )
         }
@@ -255,7 +265,7 @@ final class WorktreeStore: ObservableObject {
         if !others.isEmpty {
             groups.append(ProjectGroup(
                 name: Worktree.otherProjectName, path: nil,
-                isRegistered: false, worktrees: others))
+                isRegistered: false, isMissing: false, worktrees: others))
         }
         return groups
     }
@@ -286,6 +296,69 @@ final class WorktreeStore: ObservableObject {
     /// disk keeps appearing via discovery.
     func removeRepo(_ path: String) {
         registeredRepos.removeAll { $0 == path }
+    }
+
+    /// `~`-expanded, standardised form of a typed or picked repo path, so the
+    /// same folder always keys the same per-repo settings.
+    static func standardizedRepoPath(_ raw: String) -> String {
+        let expanded = (raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            as NSString).expandingTildeInPath
+        return URL(fileURLWithPath: expanded).standardizedFileURL.path
+    }
+
+    /// Points a repo group at the folder it now lives in — for when the repo
+    /// was moved on disk (e.g. ~/Documents → ~/Development). Runs
+    /// `git worktree repair` from the new location so its linked worktrees'
+    /// `.git` pointers follow it, then carries the registration and every
+    /// per-repo override across to `newPath`; an override already set there
+    /// wins. Returns a user-facing problem instead when `newPath` isn't a git
+    /// repository.
+    @discardableResult
+    func relocateRepo(from oldPath: String, to newPath: String) -> String? {
+        let target = Self.standardizedRepoPath(newPath)
+        guard target != oldPath else { return nil }
+        guard FileManager.default.fileExists(
+            atPath: (target as NSString).appendingPathComponent(".git")) else {
+            return "“\(target)” doesn't look like a git repository."
+        }
+        // Best-effort: a repo with no linked worktrees has nothing to repair.
+        runGit(["-C", target, "worktree", "repair"])
+
+        // Always register the new path — the user has said where the repo
+        // lives, so it stays listed even if no worktree rediscovers it.
+        var repos = registeredRepos.filter { $0 != target }
+        if let i = repos.firstIndex(of: oldPath) {
+            repos[i] = target
+        } else {
+            repos.append(target)
+        }
+        registeredRepos = repos
+
+        func moved<V>(_ dict: [String: V]) -> [String: V] {
+            var dict = dict
+            if let value = dict.removeValue(forKey: oldPath), dict[target] == nil {
+                dict[target] = value
+            }
+            return dict
+        }
+        openClaudeOnStartByRepo = moved(openClaudeOnStartByRepo)
+        UserDefaults.standard.set(openClaudeOnStartByRepo, forKey: Self.openClaudeKey)
+        postStartScriptByRepo = moved(postStartScriptByRepo)
+        UserDefaults.standard.set(postStartScriptByRepo, forKey: Self.postStartByRepoKey)
+        agentByRepo = moved(agentByRepo)
+        UserDefaults.standard.set(agentByRepo, forKey: Self.agentByRepoKey)
+        if defaultSourceRepo == oldPath { defaultSourceRepo = target }
+        scan()
+        return nil
+    }
+
+    /// Recomputes `missingRepoPaths` over every registered and discovered repo.
+    private func refreshMissingRepos() {
+        let fm = FileManager.default
+        let paths = Set(worktrees.compactMap(\.projectPath)).union(registeredRepos)
+        missingRepoPaths = paths.filter {
+            !fm.fileExists(atPath: ($0 as NSString).appendingPathComponent(".git"))
+        }
     }
 
     /// The repo's explicit override, or nil when it inherits the global default.
@@ -465,6 +538,7 @@ final class WorktreeStore: ObservableObject {
     }
 
     func scan() {
+        defer { refreshMissingRepos() }
         let fm = FileManager.default
         let expanded = (rootPath as NSString).expandingTildeInPath
         let url = URL(fileURLWithPath: expanded)
