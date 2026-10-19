@@ -26,14 +26,35 @@ struct JiraClient {
         return nil
     }
 
-    /// Transitions `key` to the status named `status` (case-insensitive). A
-    /// ticket already in that status is left alone. Returns a user-facing
-    /// problem, or nil on success / no-op.
+    /// Assigns `key` to the token's owner, then transitions it to the status
+    /// named `status` (case-insensitive) — assigning first, as some workflows
+    /// require an assignee to move a ticket. Steps already done are skipped.
+    /// Returns a user-facing problem, or nil on success / no-op.
     func moveIssue(_ key: String, toStatus status: String) async -> String? {
+        // Jira answers 404, not 401, when a token isn't accepted for this URL
+        // (e.g. a scoped token used on the site URL): requests run anonymously
+        // and the issue is invisible. `myself` tells that apart up front, and
+        // gives the account to assign.
+        let me: String
         do {
-            let issue = try await get("issue/\(key)?fields=status")
-            if let fields = issue["fields"] as? [String: Any],
-               let current = (fields["status"] as? [String: Any])?["name"] as? String,
+            guard let id = try await get("myself")["accountId"] as? String else {
+                throw JiraError.http(401, "")
+            }
+            me = id
+        } catch JiraError.http {
+            return "Jira didn't accept the API token for \(baseURL.absoluteString) — "
+                + "check the email and token, or for a scoped token set the site to "
+                + "https://api.atlassian.com/ex/jira/<cloudId>."
+        } catch {
+            return "Couldn't reach Jira: \(error.localizedDescription)"
+        }
+        do {
+            let issue = try await get("issue/\(key)?fields=status,assignee")
+            let fields = issue["fields"] as? [String: Any] ?? [:]
+            if (fields["assignee"] as? [String: Any])?["accountId"] as? String != me {
+                try await send("PUT", "issue/\(key)/assignee", body: ["accountId": me])
+            }
+            if let current = (fields["status"] as? [String: Any])?["name"] as? String,
                current.caseInsensitiveCompare(status) == .orderedSame {
                 return nil
             }
@@ -54,7 +75,7 @@ struct JiraClient {
                                body: ["transition": ["id": id]])
             return nil
         } catch let JiraError.http(code, _) where code == 401 || code == 403 {
-            return "Jira rejected the credentials in Settings — check the email and API token."
+            return "Jira wouldn't let you assign or move \(key) — check your permissions on its project."
         } catch JiraError.http(404, _) {
             return "Jira couldn't find \(key), or you don't have access to it."
         } catch {
