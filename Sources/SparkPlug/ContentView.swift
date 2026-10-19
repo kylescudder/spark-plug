@@ -66,6 +66,7 @@ struct ContentView: View {
     @State private var pendingWorktreeSettings: Worktree?
     @State private var sessionToDelete: AgentSession?
     @State private var worktreeToDelete: Worktree?
+    @State private var repoToRemove: ProjectGroup?
     @State private var searchText = ""
     @State private var listHeight: CGFloat = 0
     @FocusState private var searchFocused: Bool
@@ -177,6 +178,17 @@ struct ContentView: View {
                         onConfirm: { store.deleteWorktree(wt) },
                         onDismiss: { worktreeToDelete = nil }
                     )
+                } else if let group = repoToRemove {
+                    ConfirmDeleteCard(
+                        title: "Remove \(group.name) from the list?",
+                        message: "Spark Plug will stop showing “\(group.name)” and forget it. Nothing on disk is deleted — you can add it again later.",
+                        confirmLabel: "Remove",
+                        onConfirm: {
+                            if let path = group.path { store.removeRepo(path) }
+                            return true
+                        },
+                        onDismiss: { repoToRemove = nil }
+                    )
                 } else if let launch = store.pendingSessionLaunch {
                     SessionPickerCard(launch: launch, store: store)
                 }
@@ -191,6 +203,7 @@ struct ContentView: View {
         pendingNewSession != nil || pendingNewWorktree != nil
             || pendingRepoSettings != nil || pendingWorktreeSettings != nil
             || sessionToDelete != nil || worktreeToDelete != nil
+            || repoToRemove != nil
             || store.pendingSessionLaunch != nil
     }
 
@@ -484,7 +497,7 @@ struct ContentView: View {
                     if group.isRegistered && group.worktrees.isEmpty {
                         Divider()
                         Button {
-                            store.removeRepo(path)
+                            repoToRemove = group
                         } label: {
                             Label("Remove from list", systemImage: "minus.circle")
                         }
