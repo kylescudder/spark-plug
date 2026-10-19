@@ -101,7 +101,11 @@ final class WorktreeStore: ObservableObject {
     private static let agentKey = "SparkPlug.defaultAgent"
     private static let agentByRepoKey = "SparkPlug.agentByRepo"
     private static let agentByWorktreeKey = "SparkPlug.agentByWorktree"
+    private static let jiraURLKey = "SparkPlug.jiraBaseURL"
+    private static let jiraEmailKey = "SparkPlug.jiraEmail"
+    private static let jiraStatusKey = "SparkPlug.jiraActiveStatus"
     static let defaultSetupCommand = "./scripts/setup-worktree.sh {ticket} {brief} {base}"
+    static let defaultJiraActiveStatus = "Current Active Issue"
     /// The global default's initial value: create-and-launch Claude, the
     /// behaviour before the setting existed.
     static let defaultOpenClaudeOnStart = true
@@ -185,6 +189,23 @@ final class WorktreeStore: ObservableObject {
     /// Absent means inherit: infer from the worktree's latest session, else fall
     /// to the repo/global default. The leaf of the Global → Repo → Worktree chain.
     @Published private var agentByWorktree: [String: String]
+    /// Jira site (e.g. https://acme.atlassian.net). With the email, API token
+    /// and status all set, starting a session moves its ticket into
+    /// `jiraActiveStatus`; any one empty turns the feature off.
+    @Published var jiraBaseURL: String {
+        didSet { UserDefaults.standard.set(jiraBaseURL, forKey: Self.jiraURLKey) }
+    }
+    @Published var jiraEmail: String {
+        didSet { UserDefaults.standard.set(jiraEmail, forKey: Self.jiraEmailKey) }
+    }
+    /// Kept in the Keychain (see `JiraToken`), mirrored here for the UI.
+    @Published var jiraToken: String {
+        didSet { JiraToken.write(jiraToken) }
+    }
+    /// Status a ticket moves to when a session starts for it.
+    @Published var jiraActiveStatus: String {
+        didSet { UserDefaults.standard.set(jiraActiveStatus, forKey: Self.jiraStatusKey) }
+    }
     @Published private(set) var worktrees: [Worktree] = []
     @Published var errorMessage: String?
     /// Set when multiple sessions are running and the user must choose one.
@@ -236,6 +257,11 @@ final class WorktreeStore: ObservableObject {
             if let raw = value as? String { agentWorktrees[path] = raw }
         }
         self.agentByWorktree = agentWorktrees
+        self.jiraBaseURL = UserDefaults.standard.string(forKey: Self.jiraURLKey) ?? ""
+        self.jiraEmail = UserDefaults.standard.string(forKey: Self.jiraEmailKey) ?? ""
+        self.jiraToken = JiraToken.read()
+        self.jiraActiveStatus = UserDefaults.standard.string(forKey: Self.jiraStatusKey)
+            ?? Self.defaultJiraActiveStatus
         scan()
     }
 
@@ -684,6 +710,7 @@ final class WorktreeStore: ObservableObject {
             }
             self.launch(command, windowName: dirName, choice: sessionChoice)
         }
+        markActiveInJira([ticket, dirName])
     }
 
     /// Brings `base` up to date with its remote in `repo`. Run off the main
@@ -954,17 +981,49 @@ final class WorktreeStore: ObservableObject {
     /// analogue here and collapses to empty.
     func startSession(in worktree: Worktree, agent: Agent, name: String?) {
         let trimmed = name?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let branch = currentBranch(in: worktree.url.path) ?? ""
         let command = appendPostStart(
             to: "cd \(singleQuote(worktree.url.path)) && clear",
             script: postStartScript(for: worktree),
             ticket: "",
             brief: trimmed ?? "",
-            base: currentBranch(in: worktree.url.path) ?? "",
+            base: branch,
             openClaude: openClaudeOnStart(for: worktree),
             agent: agent,
             sessionLabel: trimmed)
         let label = trimmed.flatMap { $0.isEmpty ? nil : $0 } ?? worktree.name
         launch(command, windowName: label)
+        markActiveInJira([worktree.name, branch])
+    }
+
+    /// Whether the Jira settings are complete enough to move tickets.
+    var jiraConfigured: Bool {
+        [jiraBaseURL, jiraEmail, jiraToken, jiraActiveStatus].allSatisfy {
+            !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+    }
+
+    /// Moves the ticket a new session is for into `jiraActiveStatus`, taking
+    /// the first issue key found in `candidates` (ticket, folder, branch). Runs
+    /// in the background; silent when Jira isn't configured or no key is found,
+    /// and surfaces a failure via `errorMessage` without affecting the launch.
+    private func markActiveInJira(_ candidates: [String]) {
+        guard jiraConfigured,
+              let key = JiraClient.issueKey(in: candidates),
+              let url = URL(string: jiraBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+                  .trimmingCharacters(in: CharacterSet(charactersIn: "/")) + "/") else { return }
+        let client = JiraClient(
+            baseURL: url,
+            email: jiraEmail.trimmingCharacters(in: .whitespacesAndNewlines),
+            token: jiraToken.trimmingCharacters(in: .whitespacesAndNewlines))
+        let status = jiraActiveStatus.trimmingCharacters(in: .whitespacesAndNewlines)
+        Self.debugLog("jira: moving \(key) to \(status)")
+        Task {
+            if let problem = await client.moveIssue(key, toStatus: status) {
+                Self.debugLog("jira: \(problem)")
+                self.errorMessage = problem
+            }
+        }
     }
 
     /// Appends the post-start script and, when `openClaude`, the agent launch to
