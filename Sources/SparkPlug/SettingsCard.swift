@@ -13,6 +13,10 @@ struct SettingsCard: View {
     @State private var multiplexer: Multiplexer = .tmux
     @State private var agent: Agent = .claude
     @State private var openClaudeOnStart: Bool = true
+    @State private var jiraBaseURL: String = ""
+    @State private var jiraEmail: String = ""
+    @State private var jiraToken: String = ""
+    @State private var jiraStatus: String = ""
 
     private var version: String {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev"
@@ -111,6 +115,24 @@ struct SettingsCard: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Jira").font(.caption).foregroundStyle(.secondary)
+                TextField("https://your-site.atlassian.net", text: $jiraBaseURL)
+                    .textFieldStyle(.roundedBorder)
+                HStack(spacing: 8) {
+                    TextField("Email", text: $jiraEmail)
+                        .textFieldStyle(.roundedBorder)
+                    SecureField("API token", text: $jiraToken)
+                        .textFieldStyle(.roundedBorder)
+                }
+                TextField(WorktreeStore.defaultJiraActiveStatus, text: $jiraStatus)
+                    .textFieldStyle(.roundedBorder)
+                Text("When a session starts, the ticket key in its ticket, folder or branch (e.g. MP5-123) is moved to this status. Leave any field empty to turn it off. The token is kept in your Keychain.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
             HStack {
                 Spacer()
                 Button("Cancel") { dismiss() }
@@ -130,6 +152,10 @@ struct SettingsCard: View {
             multiplexer = store.multiplexer
             agent = store.defaultAgent
             openClaudeOnStart = store.openClaudeOnStartGlobal
+            jiraBaseURL = store.jiraBaseURL
+            jiraEmail = store.jiraEmail
+            jiraToken = store.jiraToken
+            jiraStatus = store.jiraActiveStatus
         }
     }
 
@@ -157,6 +183,11 @@ struct SettingsCard: View {
         if openClaudeOnStart != store.openClaudeOnStartGlobal {
             store.openClaudeOnStartGlobal = openClaudeOnStart
         }
+        let trim = { (s: String) in s.trimmingCharacters(in: .whitespacesAndNewlines) }
+        if trim(jiraBaseURL) != store.jiraBaseURL { store.jiraBaseURL = trim(jiraBaseURL) }
+        if trim(jiraEmail) != store.jiraEmail { store.jiraEmail = trim(jiraEmail) }
+        if trim(jiraToken) != store.jiraToken { store.jiraToken = trim(jiraToken) }
+        if trim(jiraStatus) != store.jiraActiveStatus { store.jiraActiveStatus = trim(jiraStatus) }
         dismiss()
     }
 }
