@@ -127,7 +127,7 @@ struct SettingsCard: View {
                 }
                 TextField(WorktreeStore.defaultJiraActiveStatus, text: $jiraStatus)
                     .textFieldStyle(.roundedBorder)
-                Text("When a session starts, the ticket key in its ticket, folder or branch (e.g. MP5-123) is moved to this status. Leave any field empty to turn it off. The token is kept in your Keychain.")
+                Text("When a session starts, the ticket key in its ticket, folder or branch (e.g. MP5-123) is assigned to you and moved to this status. Leave any field empty to turn it off. The token is kept in your Keychain.")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
